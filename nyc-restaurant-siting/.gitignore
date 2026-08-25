@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+processed/
+.streamlit/secrets.toml
+
+# Source data: large, public, and re-downloadable from NYC Open Data.
+*.csv
+*.json
+*.xlsx

@@ -1,0 +1,13 @@
+# Dark navy location-intelligence shell (tokens in assets/styles.css).
+# Declared, not inferred: the maps and charts pick their validated palette
+# from theme.base, and a light palette on the dark basemap fails contrast.
+[theme]
+base = "dark"
+primaryColor = "#65E3B0"
+backgroundColor = "#07111F"
+secondaryBackgroundColor = "#0D1B2B"
+textColor = "#F5F8FC"
+font = "sans serif"
+
+[server]
+headless = true

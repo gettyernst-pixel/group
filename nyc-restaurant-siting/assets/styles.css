@@ -1,0 +1,322 @@
+/* ==========================================================================
+   Design system — single source of visual truth.
+   Editorial, calm, near-square. Hierarchy from whitespace, hairline borders
+   and type — never from elevation. Plum is an accent, not a theme.
+   ========================================================================== */
+
+:root {
+    /* Dark navy location-intelligence shell */
+    --canvas: #07111F;
+    --surface: #0D1B2B;
+
+    --accent: #65E3B0;
+    --accent-soft: #112238;
+    --accent-outline: #65E3B0;
+
+    --text: #F5F8FC;
+    --text-secondary: #9AAABD;
+    --text-muted: #7A8CA1;
+    --text-faint: #51637A;
+
+    --border: rgba(255,255,255,0.08);
+    --hairline: rgba(255,255,255,0.06);
+
+    --graphite: #112238;
+    --positive: #65E3B0;
+    --caution: #F1B66C;
+    --negative: #E87878;
+
+    --radius: 2px;
+    --page-width: 1240px;
+
+    --font: "Inter", "Helvetica Neue", Arial, system-ui, sans-serif;
+    --mono: "DM Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+/* ---- shell ---------------------------------------------------------------- */
+[data-testid="stAppViewContainer"] { background: var(--canvas); }
+[data-testid="stHeader"] { display: none; }
+[data-testid="stSidebar"], [data-testid="collapsedControl"] { display: none; }
+[data-testid="stMainBlockContainer"] {
+    max-width: var(--page-width);
+    padding: 0 32px 96px 32px;
+}
+html, body, [data-testid="stAppViewContainer"] * { font-family: var(--font); }
+/* the global font override must never clobber Streamlit's icon ligatures */
+[data-testid="stIconMaterial"],
+span[class*="material-symbols"], .material-icons {
+    font-family: "Material Symbols Rounded" !important;
+}
+
+/* ---- typography ----------------------------------------------------------- */
+h1, h2, h3, h4 { font-weight: 400 !important; color: var(--text); }
+[data-testid="stMarkdownContainer"] h1 {
+    font-size: 48px; line-height: 1.05; letter-spacing: -0.02em;
+}
+[data-testid="stMarkdownContainer"] h2 {
+    font-size: 34px; line-height: 1.1; letter-spacing: -0.015em;
+    margin-top: 8px;
+}
+[data-testid="stMarkdownContainer"] h3 {
+    font-size: 24px; line-height: 1.15; letter-spacing: -0.01em;
+}
+[data-testid="stMarkdownContainer"] h4 { font-size: 18px; font-weight: 500 !important; }
+[data-testid="stMarkdownContainer"] p { color: var(--text-secondary); font-size: 15px; }
+[data-testid="stCaptionContainer"] p { color: var(--text-muted); font-size: 13px; }
+
+/* the display class for the two hero headlines */
+.jx-display {
+    font-size: 58px; font-weight: 400; line-height: 1.02;
+    letter-spacing: -0.025em; color: var(--text); margin: 6px 0 18px 0;
+}
+@media (max-width: 900px) { .jx-display { font-size: 40px; } }
+
+.jx-eyebrow {
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--text-muted);
+}
+.jx-eyebrow .num { color: var(--accent); margin-right: 8px; }
+
+/* ---- top header + stage nav ---------------------------------------------- */
+.jx-header {
+    display: flex; align-items: center; justify-content: space-between;
+    height: 60px; border-bottom: 1px solid var(--border);
+    margin: 0 0 40px 0;
+}
+.jx-wordmark { font-size: 16px; font-weight: 600; color: var(--text);
+               letter-spacing: -0.01em; }
+.jx-stages { display: flex; gap: 28px; }
+.jx-stage {
+    font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--text-faint);
+    padding: 4px 0; border-bottom: 2px solid transparent;
+}
+.jx-stage.done { color: var(--text-muted); }
+.jx-stage.active { color: var(--text); border-bottom-color: var(--accent); }
+.jx-header-right { font-family: var(--mono); font-size: 12px;
+                   color: var(--text-muted); letter-spacing: 0.05em; }
+
+/* ---- widgets: near-square, hairline, no chrome ---------------------------- */
+[data-testid="stTextInput"] input,
+[data-testid="stNumberInput"] input,
+[data-testid="stSelectbox"] > div > div {
+    background: var(--surface) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    color: var(--text) !important;
+    box-shadow: none !important;
+}
+[data-testid="stNumberInput"] button {
+    background: var(--surface) !important; border-radius: 0 !important;
+    color: var(--text-muted) !important;
+}
+[data-testid="stWidgetLabel"] p {
+    font-family: var(--mono); font-size: 11.5px !important;
+    letter-spacing: 0.07em; text-transform: uppercase;
+    color: var(--text-muted) !important;
+}
+
+/* buttons: graphite primary, quiet hairline secondary */
+[data-testid="stBaseButton-primary"] {
+    background: var(--graphite) !important; color: var(--text) !important;
+    border-color: var(--accent) !important;
+  border: 1px solid var(--accent) !important;
+    border: 1px solid var(--graphite) !important;
+    border-radius: var(--radius) !important;
+    box-shadow: none !important; font-weight: 500;
+}
+[data-testid="stBaseButton-primary"]:hover { background: #1d161d !important; }
+[data-testid="stBaseButton-primary"] p { color: var(--surface) !important; }
+[data-testid="stBaseButton-primary"]:disabled { opacity: 0.45; }
+[data-testid="stBaseButton-secondary"] p { color: var(--text) !important; }
+[data-testid="stBaseButton-secondary"] {
+    background: var(--surface) !important; color: var(--text) !important;
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important; box-shadow: none !important;
+}
+[data-testid="stBaseButton-secondary"]:hover { border-color: var(--graphite) !important; }
+
+/* containers with border become the "unified surface" */
+[data-testid="stVerticalBlockBorderWrapper"] > div {
+    border-radius: var(--radius) !important;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    background: var(--surface);
+    border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important;
+    box-shadow: none !important;
+}
+
+/* expanders: hairline, square */
+[data-testid="stExpander"] details {
+    background: var(--surface); border: 1px solid var(--border) !important;
+    border-radius: var(--radius) !important; box-shadow: none !important;
+}
+[data-testid="stExpander"] summary p { color: var(--text-secondary); font-size: 14px; }
+
+/* metrics: plain aligned stacks, not tiles */
+[data-testid="stMetric"] {
+    background: transparent; border: none; padding: 0;
+}
+[data-testid="stMetricLabel"] p {
+    font-family: var(--mono) !important; font-size: 11px !important;
+    letter-spacing: 0.07em; text-transform: uppercase;
+    color: var(--text-muted) !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 30px !important; font-weight: 400 !important;
+    color: var(--text) !important; letter-spacing: -0.01em;
+}
+
+/* alerts: calm, hairline, no saturated fills */
+[data-testid="stAlert"] {
+    border-radius: var(--radius) !important; box-shadow: none !important;
+    border: 1px solid var(--border) !important;
+    background: var(--surface) !important;
+}
+[data-testid="stAlert"] p { color: var(--text-secondary) !important; font-size: 14px; }
+
+/* dataframes / tables */
+[data-testid="stDataFrame"] { border: 1px solid var(--border); border-radius: var(--radius); }
+
+/* slider + radio accents */
+[data-testid="stSlider"] [role="slider"] { background: var(--graphite) !important; }
+[data-testid="stSlider"] [data-baseweb="slider"] div[style*="background"] { border-radius: 0 !important; }
+
+hr { border-color: var(--hairline) !important; margin: 56px 0 !important; }
+[data-testid="stHeaderActionElements"] { display: none; }
+
+/* ---- product components --------------------------------------------------- */
+.jx-searchline {
+    font-family: var(--mono); font-size: 12px; color: var(--text-faint);
+    letter-spacing: 0.05em; margin-top: 14px;
+}
+
+.jx-context {
+    display: flex; align-items: baseline; gap: 18px;
+    border-bottom: 1px solid var(--border); padding-bottom: 14px;
+    margin-bottom: 40px;
+}
+.jx-context .what { font-family: var(--mono); font-size: 12px;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--accent); }
+.jx-context .where { font-size: 15px; color: var(--text); font-weight: 500; }
+
+/* decision hero */
+.jx-hero { padding: 8px 0 8px 0; }
+.jx-hero .verdict { font-size: 44px; font-weight: 400; line-height: 1.08;
+    letter-spacing: -0.02em; color: var(--text); margin: 10px 0 12px 0; }
+.jx-hero .explain { font-size: 16px; color: var(--text-secondary);
+    max-width: 640px; line-height: 1.5; }
+.jx-heroband { display: flex; gap: 48px; align-items: flex-end;
+    margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
+.jx-heroband .cell .k { font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+.jx-heroband .cell .v { font-size: 26px; color: var(--text); margin-top: 2px; }
+.jx-heroband .cell .v.band { font-weight: 500; }
+.jx-heroband .cell .v.index { color: var(--text-secondary); }
+
+/* evidence rows */
+.jx-row { border-top: 1px solid var(--border); padding: 20px 0;
+    display: grid; grid-template-columns: 240px 1fr 180px; gap: 24px; }
+.jx-row:last-of-type { border-bottom: 1px solid var(--border); }
+.jx-row .cat { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--text); padding-top: 2px; }
+.jx-row .body .concl { font-size: 15px; color: var(--text); line-height: 1.45; }
+.jx-row .body .ev { font-family: var(--mono); font-size: 12px;
+    color: var(--text-muted); margin-top: 7px; letter-spacing: 0.02em; }
+.jx-row .status { text-align: right; }
+@media (max-width: 900px) { .jx-row { grid-template-columns: 1fr; gap: 8px; }
+    .jx-row .status { text-align: left; } }
+
+.jx-status { display: inline-block; font-family: var(--mono); font-size: 11.5px;
+    letter-spacing: 0.07em; text-transform: uppercase; padding: 4px 10px;
+    border: 1px solid var(--border); border-radius: var(--radius);
+    color: var(--text-secondary); background: var(--surface); }
+.jx-status.good { color: var(--positive); border-color: var(--positive); }
+.jx-status.concern { color: var(--negative); border-color: var(--negative); }
+.jx-status.limited { color: var(--text-muted); border-style: dashed; }
+
+/* stat strip */
+.jx-strip { display: flex; border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border); margin: 10px 0 26px 0; }
+.jx-strip .cell { flex: 1; padding: 18px 24px 16px 0; }
+.jx-strip .cell + .cell { border-left: 1px solid var(--hairline); padding-left: 24px; }
+.jx-strip .v { font-size: 30px; font-weight: 400; color: var(--text);
+    letter-spacing: -0.01em; }
+.jx-strip .k { font-family: var(--mono); font-size: 11px; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--text-muted); margin-top: 3px; }
+
+/* ranked competitor rows */
+.jx-comp { border-top: 1px solid var(--border); padding: 13px 2px;
+    display: grid; grid-template-columns: 34px 1fr auto; gap: 12px;
+    align-items: baseline; }
+.jx-comp:last-of-type { border-bottom: 1px solid var(--border); }
+.jx-comp .rank { font-family: var(--mono); font-size: 12px; color: var(--text-faint); }
+.jx-comp .name { font-size: 15px; font-weight: 500; color: var(--text); }
+.jx-comp .meta { font-family: var(--mono); font-size: 12px;
+    color: var(--text-muted); margin-top: 3px; letter-spacing: 0.02em; }
+
+/* recommendation panel */
+.jx-reco { background: var(--accent-soft); border: 1px solid var(--accent-outline);
+    border-radius: var(--radius); padding: 40px 44px; margin-top: 8px; }
+.jx-reco .verdict { font-size: 34px; font-weight: 400; letter-spacing: -0.015em;
+    color: var(--text); line-height: 1.12; margin: 8px 0 14px 0; }
+.jx-reco p { color: var(--text-secondary); font-size: 15px; max-width: 660px; }
+.jx-reco .pair { display: flex; gap: 48px; margin-top: 26px; }
+.jx-reco .pair .k { font-family: var(--mono); font-size: 11px;
+    letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+.jx-reco .pair .v { font-size: 15px; color: var(--text); margin-top: 4px;
+    font-weight: 500; }
+
+/* aligned benchmark rows */
+.jx-bench { max-width: 560px; }
+.jx-bench .r { display: flex; justify-content: space-between;
+    border-top: 1px solid var(--hairline); padding: 9px 2px; }
+.jx-bench .r:last-child { border-bottom: 1px solid var(--hairline); }
+.jx-bench .k { font-size: 14px; color: var(--text-secondary); }
+.jx-bench .v { font-family: var(--mono); font-size: 13px; color: var(--text); }
+
+/* ---- compact signal strip: the 3-second read under the hero ---- */
+.jx-signals { display: flex; flex-wrap: wrap;
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+.jx-signals .cell { flex: 1 1 0; min-width: 132px; padding: 12px 16px 12px 14px;
+  border-right: 1px solid var(--hairline); }
+.jx-signals .cell:last-child { border-right: none; }
+.jx-signals .k { font-family: "DM Mono", SFMono-Regular, monospace;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--text-muted); margin-bottom: 4px; }
+.jx-signals .s { font-size: 15px; }
+
+
+/* ==== v4 workspace shell: persistent map, internally-scrolling panel ==== */
+.block-container { max-width: 100% !important; padding: 0.6rem 1.1rem 0 1.1rem !important; }
+
+/* map column: sticky so it never scrolls away with the panel */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
+  position: sticky; top: 0.4rem; align-self: flex-start; min-width: 0;
+}
+/* intelligence panel: readable floor, internal scroll, never one-word wrap */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
+  min-width: 380px; max-width: 460px;
+  max-height: calc(100vh - 80px); overflow-y: auto; padding-right: 6px;
+}
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child
+  [data-testid="stMetricValue"] { font-size: 22px !important; }
+
+/* below the side-by-side breakpoint, columns stack: release the clamp */
+@media (max-width: 900px) {
+  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
+    min-width: 0; max-width: none; max-height: none; overflow-y: visible;
+  }
+  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
+    position: static;
+  }
+}
+
+/* ==== v4 typography: sans-first, monospace only for micro-metadata ==== */
+.jx-row .cat, .jx-strip .k, .jx-signals .k {
+  font-family: Inter, "Helvetica Neue", system-ui, sans-serif !important;
+  text-transform: none !important; letter-spacing: 0.01em !important;
+  font-size: 13px !important;
+}
+.jx-eyebrow { letter-spacing: 0.06em; }
