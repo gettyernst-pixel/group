@@ -243,14 +243,15 @@ def test_toolbar_state_survives_navigation():
     keyed-widget state is mirrored so it survives runs it does not render
     in (the Method view has no toolbar at all)."""
     at = area_run("Japanese restaurant in Murray Hill")
-    at.radio[0].set_value("All")
+    # v7.1: the filter is a compact segmented control, not a radio stack
+    at.session_state["ws_comp"] = "All restaurants"
     at = at.run()
-    assert ss(at, "ws_comp") == "All"
+    assert ss(at, "ws_comp") == "All restaurants"
     at = _nav(at, "Explore")
-    assert ss(at, "ws_comp") == "All", "filter reset by view switch"
+    assert ss(at, "ws_comp") == "All restaurants", "filter reset by view"
     at = _nav(at, "Method")            # toolbar absent in this view
     at = _nav(at, "Assess")
-    assert ss(at, "ws_comp") == "All", "filter reset by Method roundtrip"
+    assert ss(at, "ws_comp") == "All restaurants", "reset by Method"
     assert ss(at, "selected_area") == "MN0603"
 
 
@@ -268,8 +269,13 @@ def test_method_visible_without_sidebar():
 
 
 def test_selected_area_prompt_autofits_bounds():
+    """v7.1: the fit is keyed on the selection EVENT (area + token), so
+    re-selecting the same area still refits. last_fitted_area is now the
+    bare code and last_fitted_view carries the token."""
     at = area_run("Japanese restaurant in Murray Hill")
-    assert ss(at, "last_fitted_area") == f"area:{ss(at, 'selected_area')}"
+    code = ss(at, "selected_area")
+    assert ss(at, "last_fitted_area") == code
+    assert ss(at, "last_fitted_view") == f"area:{code}:{ss(at, 'area_fit_token')}"
 
 
 # ---------------------------------------------------------------- area panel
@@ -451,7 +457,8 @@ def test_marker_legend_present_and_traces_vectorized():
     fig = go.Figure()
     workspace_map.add_restaurant_markers(fig, frame, frame)
     names = [t.name for t in fig.data]
-    assert any(n.startswith("Similar concept") for n in names)
+    # v7.2 vocabulary: the legend mirrors the filter control
+    assert any(n.startswith("Same cuisine") for n in names)
     assert any(n.startswith("Other restaurant") for n in names)
     assert len(fig.data) == 2, "one vectorized trace per group, never " \
                                "one trace per restaurant"
@@ -469,7 +476,7 @@ def test_similar_filter_hides_other_markers():
         "cuisine": ["Japanese"], "address": ["1 Main St"]})
     fig = go.Figure()
     workspace_map.add_restaurant_markers(fig, frame, frame, show_other=False)
-    assert [t.name for t in fig.data] == ["Similar concept (1)"]
+    assert [t.name for t in fig.data] == ["Same cuisine (1)"]
 
 
 def test_polygon_fill_mutes_under_markers():

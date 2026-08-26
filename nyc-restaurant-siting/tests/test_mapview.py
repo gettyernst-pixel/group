@@ -72,8 +72,23 @@ class TestPalettes:
             assert lums == sorted(lums, reverse=True)
 
     def test_basemaps_match_their_surface(self):
-        assert mapview.THEMES["light"]["basemap"] == "carto-positron"
-        assert mapview.THEMES["dark"]["basemap"] == "carto-darkmatter"
+        """
+        Both themes build their basemap from the shared CARTO vector style
+        — Dark Matter for the dark shell, Positron for the light one. The
+        theme dict carries no style name of its own, so a watermarked
+        raster shorthand cannot creep back in through it.
+        """
+        from nycsiting import workspace_map
+        for theme in ("light", "dark"):
+            assert mapview.THEMES[theme]["basemap"] is None
+
+        dark = workspace_map.basemap_style(dark=True)
+        light = workspace_map.basemap_style(dark=False)
+        assert "dark-matter" in dark
+        assert "positron" in light
+        assert dark != light
+        for style in (dark, light):
+            assert style.startswith("https://basemaps.cartocdn.com/gl/")
 
 
 class TestGrouping:

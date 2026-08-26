@@ -145,3 +145,50 @@ Behavior verified in tests.
 - Final validation: three scenarios traced end-to-end (see
   `tests/test_validation_scenarios.py`): dense Manhattan corner, Queens
   storefront with history, sparse outer-borough address.
+
+# Addendum — 2026-08-25: DOHMH vocabulary rename repair
+
+DOHMH revised its cuisine vocabulary between the 2017 archive and the 2026
+extract: 11 labels exist only in the archive, 17 only in the extract. The
+panel keeps each restaurant's most recent label, so for a renamed category
+every closure kept the legacy label and every survivor was relabelled — the
+legacy label read 0% cohort survival and its successor 100%, in both cases
+a taxonomy artifact. Previously guarded only at presentation level
+(`app.py _label_artifact`, baseline ≥ 0.999).
+
+Fix: `cuisines.DOHMH_2017_TO_2026` maps each archive-only label to its 2026
+successor, applied inside `clean_label` so the panel speaks one vocabulary.
+Every pair was verified by matching CAMIS across the two files (fraction of
+matched establishments carrying the proposed successor is in the map's
+comments; weakest is 'Soups & Sandwiches' at 2/6, kept on name
+correspondence). 'Delicatessen'→'Sandwiches' and 'Pizza/Italian'→'Pizza'
+are retirements into pre-existing labels, mapped on the same cohort
+argument.
+
+Citywide 2011-17 cohort rates, before → after (survived/total):
+
+| Category (2026 label)     | legacy label before | successor before | after |
+|---------------------------|--------------------|------------------|-------|
+| Asian/Asian Fusion        | 0/280 = 0%         | 84/84 = 100%     | 84/364 = 23.1% |
+| Bakery Products/Desserts  | 0/401 = 0%         | 333/333 = 100%   | 333/734 = 45.4% |
+| Bottled Beverages         | 0/53 = 0%          | 49/49 = 100%     | 49/102 = 48.0% |
+| Coffee/Tea                | 0/1016 = 0%        | 531/531 = 100%   | 531/1547 = 34.3% |
+| Frozen Desserts           | 0/270 = 0%         | 89/89 = 100%     | 89/359 = 24.8% |
+| Latin American            | 0/525 = 0%         | 420/420 = 100%   | 420/945 = 44.4% |
+| Pizza                     | 0/296 = 0%         | 574/1359 = 42.2% | 574/1655 = 34.7% |
+| Sandwiches                | 0/219 = 0%         | 223/529 = 42.2%  | 223/748 = 29.8% |
+| Soups/Salads/Sandwiches   | 0/42 = 0%          | 10/10 = 100%     | 10/52 = 19.2% |
+| Southeast Asian           | 0/55 = 0%          | 38/38 = 100%     | 38/93 = 40.9% |
+| Steakhouse                | 0/37 = 0%          | 56/56 = 100%     | 56/93 = 60.2% |
+
+Invariants confirmed after rebuild: panel row count unchanged (48,101);
+merged cohort counts are the exact sums of their parts; citywide cohort
+unchanged at 9,723/26,505 = 36.7%; no archive-only label survives in the
+panel. Labels still at a ≥99.9% baseline are genuinely new 2026 categories
+with no 2017 counterpart (New American, Vegan, Fusion, New French, Haute
+Cuisine) — `_label_artifact` still flags these, and now only these.
+
+Regression pins re-verified against the rebuilt data: 195 Bowery / Italian
+(580 active, 45 Italian, cohort 27/41), 42 Broadway (stable, 7/30 gone),
+348 Bowery (churn, fit below no-history query). Full non-network suite:
+424 passed.

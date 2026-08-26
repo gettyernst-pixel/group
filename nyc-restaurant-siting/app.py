@@ -6,6 +6,9 @@ Data first: python build_data.py
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import re
 
 import numpy as np
@@ -15,8 +18,8 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-from nycsiting import (acs, analysis, areas, comparison, config, geometry,
-                       plan_parser, workspace_map,
+from nycsiting import (acs, analysis, areas, branding, comparison, config,
+                       geometry, plan_parser, workspace_map,
                        context, cuisines, financial_simulation as fs,
                        geocode, google_places, mapview,
                        narrative, nta, pedestrian_dot, report_pdf,
@@ -27,7 +30,17 @@ st.set_page_config(page_title="Siting — NYC Restaurant Location Intelligence",
                    layout="wide")
 
 # ---------------------------------------------------------------- data load
-@st.cache_data(show_spinner="Loading restaurant panel…")
+# WHY cache_resource, NOT cache_data, for the reference frames
+# st.cache_data returns a DEEP COPY on every hit, so asking for a frame is
+# never free: measured per rerun, load_lots() cost 355-466ms, load_locations()
+# 75-190ms and load_panel() 24-37ms purely in copying — over half of a warm
+# rerun, spent duplicating data that is never written to. cache_resource hands
+# back the same object, which is correct here because these frames are
+# READ-ONLY reference data built by build_data.py: nothing in the request path
+# assigns into them. tests/test_performance.py pins that invariant by hashing
+# the frames across a full interaction sequence, so a future in-place edit
+# fails a test instead of silently corrupting every later session.
+@st.cache_resource(show_spinner="Loading restaurant panel…")
 def load_panel() -> pd.DataFrame:
     df = pd.read_parquet(config.RESTAURANTS_PQ)
     for col in ("first_observed", "last_observed", "closed_after", "closed_before"):
@@ -35,17 +48,17 @@ def load_panel() -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_locations() -> pd.DataFrame:
     return pd.read_parquet(config.LOCATIONS_PQ)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_lots() -> pd.DataFrame:
     return pd.read_parquet(config.LOTS_PQ).set_index("bbl")
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def load_pedestrian() -> pd.DataFrame:
     return pd.read_parquet(config.PEDESTRIAN_PQ)
 
@@ -181,9 +194,66 @@ def nta_index():
     return geometry.NTAIndex()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def nta_geojson():
+    """The display FeatureCollection, built once. cache_resource for the same
+    reason as the frames above: deep-copying ~1.9MB of nested lists cost
+    ~57ms on every rerun, and plotly only reads it."""
     return nta_index().to_geojson()
+
+
+#: Where the published copy of the display geometry lives. Streamlit serves
+#: this directory at `app/static/` when enableStaticServing is on (set in
+#: .streamlit/config.toml, which ships with the repo).
+STATIC_DIR = config.APP_DIR / "static"
+
+
+@st.cache_resource(show_spinner=False)
+def nta_display_geometry() -> workspace_map.DisplayGeometry:
+    """
+    The area shapes, published ONCE as a static file and referenced by URL.
+
+    WHY: the shapes never change, but Streamlit re-sends the whole figure on
+    every interaction, and st.plotly_chart's element identity includes the
+    figure spec — so a new area, layer or filter remounts the chart and
+    re-ships the geometry. Embedded, that is ~1.0MB across the websocket per
+    click, re-parsed by the browser each time. Published, plotly.js fetches
+    the file once, the browser caches it, and the per-interaction figure
+    drops to ~40KB.
+
+    The filename carries a hash of the content, so a browser can never serve
+    a stale copy after the geometry changes: new bytes mean a new URL.
+
+    If the file cannot be written (a read-only deployment, no permission),
+    this falls back to embedding the geometry — slower, but correct. It
+    never returns a URL it has not just written, because an unfetchable URL
+    would render an EMPTY map with no error, and a blank map that looks
+    deliberate is exactly the silent failure this product must not ship.
+    """
+    geojson = nta_geojson()
+    try:
+        payload = json.dumps(geojson, separators=(",", ":"))
+        digest = hashlib.sha256(payload.encode()).hexdigest()[:12]
+        STATIC_DIR.mkdir(parents=True, exist_ok=True)
+        published = STATIC_DIR / f"nta_display.{digest}.geojson"
+        if not published.exists():
+            # Write-then-rename: a half-written file must never be served.
+            tmp = published.with_suffix(".partial")
+            tmp.write_text(payload)
+            tmp.replace(published)
+            for old in STATIC_DIR.glob("nta_display.*.geojson"):
+                if old != published:
+                    old.unlink(missing_ok=True)
+        if published.stat().st_size != len(payload.encode()):
+            raise OSError("published geometry is truncated")
+        # Relative, so it resolves correctly under a base URL path too.
+        return workspace_map.DisplayGeometry(
+            f"app/static/{published.name}",
+            [f["id"] for f in geojson["features"]])
+    except Exception as exc:                  # noqa: BLE001 - never fatal
+        logging.getLogger(__name__).warning(
+            "Serving map geometry inline (could not publish it): %s", exc)
+        return workspace_map.as_geometry(geojson)
 
 
 @st.cache_data(show_spinner=False)
@@ -201,7 +271,7 @@ def area_features_cached(_panel) -> pd.DataFrame:
     return areas.area_features(_panel, nta_assignment(_panel))
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def panel_with_nta_cached(_panel) -> pd.DataFrame:
     """
     The panel joined to its 2020 NTA assignment ONCE per session. Area
@@ -651,6 +721,13 @@ def render_google(landscape, cuisine: str, price: str | None = None,
             st.info("No cuisine or concept was specified, so there is no "
                     "live competitor query to run. Public-record inventory "
                     "below.")
+        elif landscape.reason == "no_key":
+            # Name the secret: on a fresh clone or a new Cloud deployment
+            # this is the one message that says what to add and where.
+            st.info("Live competitor enrichment is off because no "
+                    "GOOGLE_MAPS_API_KEY is configured in Streamlit "
+                    "secrets. The public-record analysis below is "
+                    "unaffected.")
         else:
             st.info("Live competitor enrichment is temporarily unavailable."
                     + (" The configured Google key was rejected — check it "
@@ -781,7 +858,10 @@ def landing_page(panel: pd.DataFrame) -> None:
     structured plan; the user confirms it before anything is analysed. Not a
     chat — intelligent search.
     """
-    st.markdown('<div style="height:56px"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="height:40px"></div>', unsafe_allow_html=True)
+    st.markdown('<div style="margin-bottom:16px;">'
+                + branding.logo_img(height=50) + '</div>',
+                unsafe_allow_html=True)
     ui.eyebrow("Restaurant location intelligence")
     ui.display("Where should your<br>restaurant go?")
     st.markdown("Tell us what you're planning.")
@@ -1813,6 +1893,41 @@ LAYER_CHOICES = {
 }
 
 
+#: The restaurant filter's user-facing vocabulary. These strings are the
+#: SINGLE source of truth: the segmented control, the microcopy and the map
+#: legend all read from them, so the control and the legend can never drift
+#: apart. "Closest / Similar / All" said nothing about what was being
+#: matched; these name the actual evidence tier.
+EXACT = "Exact concept"
+SAME_CUISINE = "Same cuisine"
+ALL_RESTAURANTS = "All restaurants"
+
+FILTER_HELP = ("Exact concept uses the most specific match supported by the "
+               "available data. Same cuisine shows broader cuisine "
+               "competitors. All restaurants shows the full restaurant "
+               "landscape.")
+
+
+def filter_caption(mode: str, cuisine: str | None, concept: str | None,
+                   limited: bool) -> str:
+    """One line saying exactly what the selected tier is showing."""
+    if mode == ALL_RESTAURANTS:
+        return "All current restaurant establishments in this area."
+    if mode == SAME_CUISINE:
+        return f"All {cuisine} restaurants in this area."
+    if limited:
+        return ("Limited data: the records identify the broader cuisine but "
+                "do not reliably classify restaurants at this concept "
+                "level.")
+    if cuisine and concept:
+        return (f"{cuisine} restaurants with {concept.lower()}-related "
+                f"concept evidence.")
+    if cuisine:
+        return f"The closest {cuisine} matches in this area."
+    return f"Establishments matching “{concept}” in this area." if concept \
+        else "The closest matches in this area."
+
+
 #: Layers that require a cuisine. With no cuisine given, the layer list
 #: simply omits them — concept-independent evidence carries the workspace.
 CUISINE_LAYERS = {"concept_fit", "cuisine_density", "opportunity_gap"}
@@ -1887,20 +2002,76 @@ def polygon_bounds(code: str) -> tuple[float, float, float, float]:
     return y0, y1, x0, x1
 
 
-def zoom_for_bounds(bounds) -> tuple[tuple[float, float], float]:
-    """fitBounds: center + a zoom derived from the polygon span + padding."""
+#: The map PANE in CSS pixels per workspace view: the map column is ~66% of
+#: the content width in Explore and ~44% in Assess, and the figure height is
+#: fixed at 640 (workspace_map._base_layout). A fit needs BOTH: a zoom level
+#: is meaningless without the viewport it has to fill.
+MAP_PANE_PX = {"explore": (920, 640), "assess": (615, 640),
+               "compare": (615, 640)}
+
+#: Padding factor: the binding axis lands at ~1/1.4 = 71% of the pane, so
+#: the whole district shows with visible surrounding geography on every
+#: side (the 65-80% target).
+AREA_FIT_PADDING = 1.4
+
+#: Tile size the basemap renders at. CARTO's VECTOR styles serve 512px
+#: tiles, so at a given zoom a pixel covers HALF the longitude that the old
+#: 256px raster tiles did. Measured on the live map: the viewport spanned
+#: 0.0295° where a 256px assumption predicted 0.0588°. Using 256 here made
+#: every area fit exactly one zoom level too deep — the reported "zooms too
+#: far into the district".
+BASEMAP_TILE_PX = 512
+
+
+def zoom_for_bounds(bounds, viewport_px: int = 820,
+                    viewport_h_px: int = 640
+                    ) -> tuple[tuple[float, float], float]:
+    """
+    True fitBounds: the centre of the area, and the largest zoom at which
+    the WHOLE polygon still fits — both axes, with padding.
+
+    Two earlier bugs are corrected here. `log2(360 / span)` fits a span to
+    one 256px tile, which on a real map left the area covering a fifth of
+    the view. Fitting only the width then over-zoomed TALL districts:
+    Murray Hill, Gramercy and Chelsea filled 94% of the map's height, so
+    their boundaries sat flush against the edge with no context around
+    them. The zoom is now the MINIMUM of the width- and height-constrained
+    zooms, so whichever axis binds is the one that fits.
+    """
     import math
     min_lat, max_lat, min_lon, max_lon = bounds
     center = ((min_lat + max_lat) / 2, (min_lon + max_lon) / 2)
-    span = max(max_lat - min_lat, max_lon - min_lon, 1e-4) * 1.35
-    zoom = float(np.clip(math.log2(360.0 / span) - 0.4, 10.0, 14.2))
-    return center, zoom
+    # Web Mercator: a degree of longitude is a constant screen width, while
+    # a degree of latitude covers 1/cos(lat) MORE screen.
+    lat_scale = max(math.cos(math.radians(center[0])), 1e-6)
+    span_lon = max(max_lon - min_lon, 1e-4) * AREA_FIT_PADDING
+    span_lat = max((max_lat - min_lat) / lat_scale, 1e-4) * AREA_FIT_PADDING
+    zoom_w = math.log2(360.0 * viewport_px / (BASEMAP_TILE_PX * span_lon))
+    zoom_h = math.log2(360.0 * viewport_h_px / (BASEMAP_TILE_PX * span_lat))
+    return center, float(np.clip(min(zoom_w, zoom_h), 9.5, 16.0))
 
 
-def select_area(code: str) -> None:
-    """THE one selection handler — polygon clicks and Top-match clicks share
-    it, so they can never behave differently."""
+def select_area(code: str, source: str = "unknown") -> None:
+    """
+    THE one area-selection handler. Every route — polygon click, Top-match
+    button, prompt-resolved neighborhood, Back to explore, any area list —
+    goes through here, so they can never behave differently.
+
+    The FIT TOKEN is the fix for the "clicking an area doesn't zoom" bug.
+    The fit used to be driven by plotly's uirevision keyed on the area id
+    alone: re-selecting the SAME area after panning produced an identical
+    revision string, so plotly kept the user's stale viewport and the map
+    never moved. Every selection EVENT now bumps a counter, so the revision
+    is new every time an area is deliberately chosen (guaranteeing a fit),
+    while ordinary reruns — filter flips, tab changes, navigation — leave it
+    untouched and preserve the user's pan/zoom.
+    """
+    if code not in nta_index().features:
+        return
     st.session_state["selected_area"] = code
+    st.session_state["area_fit_token"] = (
+        st.session_state.get("area_fit_token", 0) + 1)
+    st.session_state["area_fit_source"] = source
     st.session_state.pop("selected_restaurant", None)
 
 
@@ -2030,7 +2201,7 @@ def _apply_map_selection(event, panel) -> None:
         location = point.get("location")
         if location and location in nta_index().features:
             if st.session_state.get("selected_area") != location:
-                select_area(location)
+                select_area(location, source="polygon_click")
                 st.rerun()
 
 
@@ -2043,10 +2214,12 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
     plain session key: Streamlit drops keyed-widget state for widgets that
     skip a run (e.g. while the Method view is open), and the mirror re-seeds
     them so layer/filter selections survive any navigation."""
+    # Restaurants gets the widest share: its three labels are words, not
+    # abbreviations, and they must sit on ONE row at desktop widths.
     if mode == "site":
-        top1, top2, top3, top4 = st.columns([1.05, 1.35, 0.95, 0.95])
+        top1, top2, top3, top4 = st.columns([1.0, 1.15, 1.75, 0.8])
     else:
-        top1, top2, top3 = st.columns([1.1, 1.5, 1])
+        top1, top2, top3 = st.columns([1.0, 1.2, 1.9])
         top4 = None
     with top1:
         options = [CUISINE_ANY] + cuisine_options(panel)
@@ -2063,17 +2236,30 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
         layer_label = st.selectbox("Layer", list(choices), key="ws_layer")
         st.session_state["_layer_mirror"] = layer_label
     with top3:
-        comp_options = (["Closest", "Similar", "All"] if cuisine
-                        else ["Closest", "All"])
-        fallback = "Similar" if cuisine else "All"
+        # "Same cuisine" only exists when a cuisine was given; with none,
+        # there is no broader-cuisine set to show.
+        comp_options = ([EXACT, SAME_CUISINE, ALL_RESTAURANTS] if cuisine
+                        else [EXACT, ALL_RESTAURANTS])
+        fallback = SAME_CUISINE if cuisine else ALL_RESTAURANTS
         if st.session_state.get("ws_comp") not in comp_options:
             mirrored = st.session_state.get("_comp_mirror")
             st.session_state["ws_comp"] = (mirrored if mirrored
                                            in comp_options else fallback)
-        comp_mode = st.radio("Restaurants", comp_options,
-                             horizontal=True, key="ws_comp")
+        # A segmented control, not a radio stack: three vertically stacked
+        # options made this column far taller than Concept and Layer and
+        # left a large empty block beneath it. Selecting a segment only
+        # re-filters already-computed tiers — no reanalysis, no refit.
+        # `default` is deliberately omitted: the value is already seeded in
+        # session state above, and passing both makes Streamlit warn about a
+        # widget created with a default AND a session-state value.
+        comp_mode = st.segmented_control(
+            "Restaurants", comp_options, key="ws_comp",
+            selection_mode="single", required=True, help=FILTER_HELP)
+        if comp_mode is None:                 # nothing selected yet
+            comp_mode = st.session_state["ws_comp"]
         # Only remember a real choice: writing back the coerced fallback
-        # would permanently downgrade "Similar" after a no-cuisine detour.
+        # would permanently downgrade the cuisine tier after a no-cuisine
+        # detour.
         if comp_mode != fallback or st.session_state.get(
                 "_comp_mirror") in (None, comp_mode):
             st.session_state["_comp_mirror"] = comp_mode
@@ -2089,7 +2275,9 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
                 st.session_state["ws_radius"]
 
     layer = LAYER_CHOICES[layer_label]
-    geojson = nta_geojson()
+    # The published (URL-referenced) geometry, so the shapes are fetched once
+    # per browser rather than re-sent with every figure.
+    geojson = nta_display_geometry()
     hover = _hover_frame(panel)
     selected_area = st.session_state.get("selected_area")
 
@@ -2099,15 +2287,25 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
     # this, every rerun (marker hover, tab click) snapped the view back —
     # the reported "clicking sometimes doesn't zoom" and jumpy-map bugs.
     if selected_area:
-        center, zoom = zoom_for_bounds(polygon_bounds(selected_area))
-        view_key = f"area:{selected_area}"
+        pane_w, pane_h = MAP_PANE_PX.get(
+            st.session_state.get("workspace_view", "assess"), (820, 640))
+        center, zoom = zoom_for_bounds(polygon_bounds(selected_area),
+                                       viewport_px=pane_w,
+                                       viewport_h_px=pane_h)
+        # The token makes the revision unique per SELECTION EVENT, not per
+        # area id, so choosing the same area again still refits.
+        view_key = (f"area:{selected_area}:"
+                    f"{st.session_state.get('area_fit_token', 0)}")
     elif site is not None:
         center, zoom = (site["lat"], site["lon"]), 13.6
         view_key = f"site:{site['label']}"
     else:
         center, zoom = (40.72, -73.97), 9.9
         view_key = "nyc"
-    st.session_state["last_fitted_area"] = view_key
+    # Recorded AFTER the fit is applied so state is inspectable and
+    # testable: last_fitted_view == view_key means this viewport is current.
+    st.session_state["last_fitted_view"] = view_key
+    st.session_state["last_fitted_area"] = selected_area
 
     # Restaurant markers are the point of a selected-area view: mute the
     # thematic fill under them so points stay readable (spec section 32).
@@ -2125,7 +2323,8 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
             lats = [pt[1] for pt in poly[0]] + [poly[0][0][1]]
             fig.add_trace(go.Scattermapbox(
                 lat=lats, lon=lons, mode="lines",
-                line=dict(width=2.5, color=workspace_map.TOKENS["accent"]),
+                line=dict(width=workspace_map.SELECTED_LINE_WIDTH,
+                          color=workspace_map.TOKENS["accent"]),
                 hoverinfo="skip", showlegend=False))
         plan = st.session_state.get("confirmed_plan")
         tiers = area_tiers_cached(panel, selected_area, cuisine,
@@ -2133,18 +2332,21 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
         # When the concept cannot be identified at all, "Closest" would
         # otherwise draw an empty map while the caption promises every
         # restaurant — show them, exactly as the caption says.
-        show_other = (comp_mode == "All"
-                      or (comp_mode == "Closest" and tiers["unidentifiable"]))
+        show_other = (comp_mode == ALL_RESTAURANTS
+                      or (comp_mode == EXACT and tiers["unidentifiable"]))
         workspace_map.add_restaurant_markers(
             fig,
-            tiers["similar"] if comp_mode in ("Similar", "All") else
-            tiers["similar"].iloc[0:0],
+            tiers["similar"] if comp_mode in (SAME_CUISINE, ALL_RESTAURANTS)
+            else tiers["similar"].iloc[0:0],
             tiers["other"], show_other=show_other,
             closest=tiers["closest"])
+        st.caption(filter_caption(
+            comp_mode, cuisine, plan.concept if plan else None,
+            limited=bool(tiers["unidentifiable"])))
         if tiers["note"]:
             # Shown in every mode: the caveat describes the tier itself,
             # not the current filter, and hiding it in the default mode
-            # left "Closest match" looking like a verified concept match.
+            # left the exact-concept tier looking like a verified match.
             st.caption(tiers["note"])
 
     # Areas queued for comparison get numbered amber outlines — visually
@@ -2189,7 +2391,8 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
     # top. The competition layer's mapview figure already carries its own
     # site marker; adding a second would double it.
     if (site is not None and landscape is not None
-            and getattr(landscape, "ok", False) and comp_mode == "Similar"
+            and getattr(landscape, "ok", False)
+            and comp_mode == SAME_CUISINE
             and not selected_area):
         fig = workspace_map.competitor_markers(fig, landscape.competitors)
     if site is not None and not (layer == "competition"
@@ -3170,7 +3373,7 @@ def confirm_page(panel) -> None:
             if code:
                 st.session_state["workspace_mode"] = "area"
                 st.session_state["requested_area"] = code
-                select_area(code)
+                select_area(code, source="prompt")
                 edited = edited.copy(update=dict(
                     zipcode=area_text if area_zip else None,
                     neighborhood=(None if area_zip
@@ -3336,7 +3539,7 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
         # switch the VIEW — the site analysis stays one Assess click away.
         code = nta_index().locate(site["lat"], site["lon"])
         if code:
-            select_area(code)
+            select_area(code, source="back_to_explore")
         st.session_state["workspace_view"] = "explore"
         st.rerun()
     ui.eyebrow(f"{cuisine or 'Restaurant'} · Site analysis")
@@ -3591,7 +3794,9 @@ def render_area_explorer(panel, code: str, cuisine: str,
     if top:
         st.caption("Top cuisines: " + " · ".join(dict.fromkeys(top)))
 
-    ranking = concept_ranking_cached(panel, code)
+    with branding.chair_spinner("Loading restaurants…",
+                                cold_key=f"area:{code}:{cuisine}"):
+        ranking = concept_ranking_cached(panel, code)
     render_concept_rows(panel, code, ranking, own_concept=bool(cuisine))
     if ranking and len(ranking) > 3:
         with st.expander("More concepts & comparison"):
@@ -3686,8 +3891,10 @@ def render_top_header(stage: str) -> None:
     in_workspace = stage == "results"
     c_mark, spacer, c_new, c_ws, c_right = st.columns(
         [0.9, 1.8, 0.85, 0.85, 1.3])
-    c_mark.markdown('<div class="jx-wordmark" style="padding-top:6px;">'
-                    'Siting</div>', unsafe_allow_html=True)
+    c_mark.markdown(
+        '<div class="jx-brand">' + branding.logo_img(height=30)
+        + '<span class="jx-wordmark">Siting</span></div>',
+        unsafe_allow_html=True)
     c_new.button("New Search", key="nav_new", width="stretch",
                  type="secondary" if in_workspace else "primary",
                  on_click=_reset_search)
@@ -3740,12 +3947,18 @@ def main() -> None:
         st.error("Processed data not found. Run `python build_data.py` first.")
         st.stop()
 
-    panel = load_panel()
-    locs = load_locations()
-    lots = load_lots()
-    ped_sites = load_pedestrian()
-
+    # Styles FIRST: the very first thing a cold session does is load the
+    # panel, and its spinner has to be the branded one too — injecting
+    # afterwards would show Streamlit's default loader for the longest wait
+    # in the whole product.
     ui.inject_styles()
+
+    # Only the panel is needed by every stage. Locations, PLUTO lots and the
+    # pedestrian counts feed SITE analysis alone, so they are loaded at the
+    # point of use: an area-only session never pays their first-read cost,
+    # and the landing page never touches them at all.
+    panel = load_panel()
+
     st.session_state.setdefault("stage", "landing")
     stage = st.session_state["stage"]
     # ONE top-level navigation: New Search | Workspace. The old duplicated
@@ -3757,7 +3970,7 @@ def main() -> None:
             st.session_state["stage"] = "results"
             st.rerun()
             return
-        simulate_page(panel, locs)
+        simulate_page(panel, load_locations())
         return
     if stage == "confirm":
         confirm_page(panel)
@@ -3843,22 +4056,31 @@ def main() -> None:
         if not (40.4 <= site["lat"] <= 41.0 and -74.3 <= site["lon"] <= -73.6):
             st.error("That address resolved outside NYC — check the borough.")
             return
+        locs = load_locations()
         key = resolve_location_key(locs, site)
         report = analysis.site_report(panel, locs, site["lat"], site["lon"],
                                       cuisine, radius, key)
-        lot = context.lot_context(lots, site.get("bbl"))
-        ped = context.nearest_pedestrian(ped_sites, site["lat"], site["lon"])
-        result = score_cached(report, panel, lot, ped, radius,
-                              (site["lat"], site["lon"], cuisine, radius, key))
+        lot = context.lot_context(load_lots(), site.get("bbl"))
+        ped = context.nearest_pedestrian(load_pedestrian(), site["lat"],
+                                         site["lon"])
+        with branding.chair_spinner(
+                "Analyzing your location…",
+                cold_key=f"site:{site['label']}:{cuisine}:{radius}"):
+            result = score_cached(
+                report, panel, lot, ped, radius,
+                (site["lat"], site["lon"], cuisine, radius, key))
         # The Google text query is built deterministically from EXPLICIT
         # plan fields — "Italian brunch", "French bakery" — so a stated
         # concept sharpens the live layer without any new API.
         gq = google_concept_query(cuisine,
                                   plan.concept if plan else None)
-        landscape = (competitors_cached(
-            site["lat"], site["lon"], gq,
-            google_places.DEFAULT_RADIUS_M, site, google_api_key())
-            if gq else None)
+        with branding.chair_spinner(
+                "Checking nearby competition…",
+                cold_key=f"google:{site['label']}:{gq}"):
+            landscape = (competitors_cached(
+                site["lat"], site["lon"], gq,
+                google_places.DEFAULT_RADIUS_M, site, google_api_key())
+                if gq else None)
         verdicts = narrative.component_verdicts(result)
         fit = narrative.fit_score(result)
         band = narrative.fit_band(fit)
@@ -3883,8 +4105,11 @@ def main() -> None:
         # restaurant persistence on the same 50-neutral scale, honestly
         # labeled; concept-specific fit is simply not claimed.
         if cuisine:
-            fit_table = concept_fit_cached(panel, cuisine)
-            dens = density_cached(panel, cuisine)
+            with branding.chair_spinner(
+                    "Updating concept analysis…",
+                    cold_key=f"discovery:{cuisine}:{borough}"):
+                fit_table = concept_fit_cached(panel, cuisine)
+                dens = density_cached(panel, cuisine)
         else:
             fit_table = conceptfree_fit_cached(panel)
             dens = None
@@ -4012,7 +4237,7 @@ def main() -> None:
                         label += f", {match['conflicts']} conflict"
                 if st.button(label, key=f"top_{match['code']}",
                              width="stretch"):
-                    select_area(match["code"])
+                    select_area(match["code"], source="top_match")
                     st.rerun()
             if prefs_active:
                 st.caption("Core fit uses the same evidence rules for "

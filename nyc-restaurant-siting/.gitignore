@@ -4,6 +4,10 @@ __pycache__/
 processed/
 .streamlit/secrets.toml
 
+# Published map geometry: generated from the polygon file at startup and
+# named by content hash, so every deployment rebuilds its own copy.
+static/
+
 # Source data: large, public, and re-downloadable from NYC Open Data.
 *.csv
 *.json

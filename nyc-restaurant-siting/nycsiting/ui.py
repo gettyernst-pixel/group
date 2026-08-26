@@ -17,7 +17,17 @@ _CSS_PATH = Path(__file__).resolve().parent.parent / "assets" / "styles.css"
 
 
 def inject_styles() -> None:
+    """Shell tokens, plus the branded loader.
+
+    The spinner rules ship here so EVERY loading state — st.spinner, the
+    show_spinner text on cached functions, and the explicit chair loader —
+    renders the same mark on every page, without each call site opting in.
+    """
+    from nycsiting import branding
+
     st.markdown(f"<style>{_CSS_PATH.read_text()}</style>", unsafe_allow_html=True)
+    st.markdown(branding.spinner_css(), unsafe_allow_html=True)
+    st.markdown(branding.map_ground_css(), unsafe_allow_html=True)
 
 
 def esc(value: object) -> str:

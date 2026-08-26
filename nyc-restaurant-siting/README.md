@@ -474,7 +474,7 @@ build_data.py       ETL: raw CSVs -> processed/*.parquet
 nycsiting/
   config.py         paths, windows, thresholds
   normalize.py      address canonicalisation — every join depends on this
-  cuisines.py       DOHMH vocabulary, competitive sets, the 2021 file's remapping
+  cuisines.py       DOHMH vocabulary (2017 labels mapped forward to 2026), competitive sets
   panel.py          restaurant-level table; grain and censoring live here
   locations.py      storefront-level table; concurrency / venue detection
   analysis.py       the site query and its comparisons

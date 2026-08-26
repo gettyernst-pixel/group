@@ -94,6 +94,12 @@ def point_in_multipolygon(lon: float, lat: float, polygons) -> bool:
     return False
 
 
+#: Decimal places kept in the DISPLAY geojson. Five decimals is ~1.1m of
+#: longitude in NYC — finer than a single screen pixel at the deepest zoom
+#: the workspace allows, and it roughly halves the bytes per vertex.
+DISPLAY_DECIMALS = 5
+
+
 def simplify_ring(ring: list[tuple[float, float]],
                   tolerance: float = 0.00025) -> list[tuple[float, float]]:
     """
@@ -143,6 +149,13 @@ class NTAIndex:
         The 262 areas as a FeatureCollection for choropleth rendering.
         Simplified geometry by default — display only; spatial membership
         always runs on the original rings.
+
+        Coordinates are rounded to DISPLAY_DECIMALS. Source vertices carry
+        full float64 precision, which serialises as ~18 characters each
+        ("-73.99123456789012") and is nine orders of magnitude finer than
+        anything a screen can resolve — at NYC's latitude the sixth decimal
+        is roughly 10cm. Rounding is applied to the display copy only, so
+        it cannot reach point-in-polygon or any analytic result.
         """
         features = []
         for code, f in self.features.items():
@@ -155,7 +168,9 @@ class NTAIndex:
                                "borough": f["borough"]},
                 "geometry": {
                     "type": "MultiPolygon",
-                    "coordinates": [[[list(pt) for pt in ring]
+                    "coordinates": [[[[round(pt[0], DISPLAY_DECIMALS),
+                                       round(pt[1], DISPLAY_DECIMALS)]
+                                      for pt in ring]
                                      for ring in poly]
                                     for poly in polys]}})
         return {"type": "FeatureCollection", "features": features}
@@ -172,7 +187,12 @@ def assign_restaurants(panel: pd.DataFrame,
     placed = panel[panel["lat"].notna()]
     if cache.exists() and not force:
         stored = pd.read_parquet(cache)
-        if len(stored) == len(placed):
+        # Validated by CAMIS SET, not row count. A count match is not
+        # identity: a rebuild that geocodes one new restaurant and drops
+        # another keeps the count identical while every assignment for the
+        # changed pair is wrong, and nothing downstream would notice. The
+        # comparison costs a few milliseconds once per session.
+        if set(stored["camis"]) == set(placed["camis"]):
             return stored.set_index("camis")["nta_2020"]
 
     index = index or NTAIndex()

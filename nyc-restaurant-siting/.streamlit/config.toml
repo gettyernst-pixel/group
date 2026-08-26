@@ -11,3 +11,8 @@ font = "sans serif"
 
 [server]
 headless = true
+# Serves ./static at app/static/. The area geometry is published there once
+# and referenced by URL, so ~1MB of shapes stops riding the websocket on
+# every map interaction. app.py falls back to embedding the geometry when the
+# file cannot be written, so turning this off costs speed, never correctness.
+enableStaticServing = true

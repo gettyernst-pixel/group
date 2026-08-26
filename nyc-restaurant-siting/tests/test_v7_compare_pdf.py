@@ -169,17 +169,22 @@ def test_closest_legend_entry_present():
     fig = go.Figure()
     workspace_map.add_restaurant_markers(fig, frame, frame, closest=frame)
     names = [t.name for t in fig.data]
-    assert any(n.startswith("Closest match") for n in names)
+    # v7.2: legend wording matches the filter control exactly
+    assert any(n.startswith("Exact concept") for n in names)
     assert all(t.showlegend for t in fig.data)
 
 
 def test_filter_control_has_three_options_with_cuisine():
     at = injected_run(plan_parser.RestaurantPlan(cuisine="Italian",
                                                  neighborhood="Gramercy"))
-    assert at.radio[0].options == ["Closest", "Similar", "All"]
+    # v7.1: compact segmented control replaced the stacked radio group
+    assert list(at.segmented_control[0].options) == [
+        "Exact concept", "Same cuisine", "All restaurants"]
     at2 = injected_run(plan_parser.RestaurantPlan(concept="brunch spot",
                                                   neighborhood="Gramercy"))
-    assert at2.radio[0].options == ["Closest", "All"]
+    # no cuisine -> no "Same cuisine" tier to offer
+    assert list(at2.segmented_control[0].options) == ["Exact concept",
+                                                      "All restaurants"]
 
 
 # ------------------------------------------------------------- comparison

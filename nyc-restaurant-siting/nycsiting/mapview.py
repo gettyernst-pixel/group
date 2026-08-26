@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from . import workspace_map
+
 # --- validated palettes -----------------------------------------------------
 # Categorical, all-pairs: light worst CVD ΔE 9.2, normal-vision 24.0;
 #                         dark  worst CVD ΔE 9.4, normal-vision 20.9. Both PASS.
@@ -33,7 +35,9 @@ THEMES = {
         "muted": "#898781",
         "categorical": ["#2a78d6", "#eb6834", "#1baf7a"],
         "ordinal": ["#86b6ef", "#5598e7", "#2a78d6", "#184f95"],
-        "basemap": "carto-positron",
+        # Token-free OSM style (see workspace_map.basemap_style): every
+        # CARTO basemap now serves an "API KEY REQUIRED" watermark.
+        "basemap": None,
     },
     "dark": {
         "surface": "#1a1a19",
@@ -41,7 +45,7 @@ THEMES = {
         "muted": "#898781",
         "categorical": ["#3987e5", "#d95926", "#199e70"],
         "ordinal": ["#b7d3f6", "#86b6ef", "#3987e5", "#1c5cab"],
-        "basemap": "carto-darkmatter",
+        "basemap": None,
     },
 }
 
@@ -192,7 +196,8 @@ def build_map(area: pd.DataFrame, site: dict, cuisine: str,
     # that does. Mapbox fills the whole paper, so the bottom margin is what
     # creates the strip it lives on — with b=0 the legend is simply clipped.
     fig.update_layout(
-        mapbox=dict(style=t["basemap"], zoom=_zoom_for(radius_m),
+        mapbox=dict(style=workspace_map.basemap_style(dark=theme == "dark"),
+                    zoom=_zoom_for(radius_m),
                     center=dict(lat=site["lat"], lon=site["lon"])),
         height=480, margin=dict(l=0, r=0, t=0, b=48),
         paper_bgcolor=t["surface"],
