@@ -30,14 +30,37 @@ class TestTrustBoundary:
             "# anthropic", ""), f"{module} references anthropic"
         assert "plan_parser" not in text, f"{module} imports the parser"
 
-    def test_llm_only_used_in_parser_module(self):
+    #: The ONLY two modules allowed to call an LLM, each with a narrow
+    #: contract: plan_parser turns user words into a validated structure;
+    #: report_writer turns an already-frozen analytical payload into prose
+    #: (no external facts, no numerals — nycsiting/report_writer.py).
+    LLM_MODULES = {"plan_parser.py", "report_writer.py"}
+
+    def test_llm_only_used_in_sanctioned_modules(self):
         offenders = []
         for py in pathlib.Path("nycsiting").glob("*.py"):
-            if py.name == "plan_parser.py":
+            if py.name in self.LLM_MODULES:
                 continue
             if "import anthropic" in py.read_text():
                 offenders.append(py.name)
         assert not offenders, offenders
+
+    def test_comparison_engine_and_renderer_stay_deterministic(self):
+        """The comparison engine computes every fact and the PDF renderer
+        prints them; neither may ever reach for a model."""
+        for module in ("comparison.py", "report_pdf.py"):
+            text = (pathlib.Path("nycsiting") / module).read_text()
+            assert "anthropic" not in text.lower(), module
+            assert "report_writer" not in text, module
+
+    def test_report_writer_never_receives_open_ended_prompts(self):
+        """The reporting editor may only see the structured payload."""
+        from nycsiting import report_writer
+        source = pathlib.Path("nycsiting/report_writer.py").read_text()
+        assert "payload.json()" in source
+        assert "Use ONLY facts present in the payload" in \
+            report_writer.SYSTEM_PROMPT
+        assert "Never write numerals" in report_writer.SYSTEM_PROMPT
 
     def test_score_does_not_depend_on_llm_text(self):
         # scoring's public surface takes reports/frames, never plan text.

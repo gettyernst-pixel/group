@@ -216,6 +216,16 @@ def search_places(lat: float, lon: float, cuisine: str, api_key: str,
             "quota",
             "The Google Places quota for this key has been exhausted.")
     if response.status_code >= 400:
+        # Google reports an invalid key as a plain 400, not a 401/403.
+        try:
+            detail = str(response.json())
+        except Exception:
+            detail = ""
+        if "API key not valid" in detail or "API_KEY_INVALID" in detail:
+            raise PlacesError(
+                "auth",
+                "Google rejected the API key as invalid — check the key in "
+                "Google Cloud (billing, rotation, or API restrictions).")
         raise PlacesError(
             "http_error",
             f"Google Places returned an error (HTTP {response.status_code}).")

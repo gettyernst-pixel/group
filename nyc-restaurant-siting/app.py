@@ -6,6 +6,8 @@ Data first: python build_data.py
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -13,12 +15,12 @@ import plotly.graph_objects as go
 import streamlit as st
 import streamlit.components.v1 as components
 
-from nycsiting import (acs, analysis, areas, config, geometry, plan_parser,
-                       workspace_map,
+from nycsiting import (acs, analysis, areas, comparison, config, geometry,
+                       plan_parser, workspace_map,
                        context, cuisines, financial_simulation as fs,
                        geocode, google_places, mapview,
-                       narrative, nta, pedestrian_dot,
-                       scoring, sim_animation, ui)
+                       narrative, nta, pedestrian_dot, report_pdf,
+                       report_writer, scoring, sim_animation, ui)
 from nycsiting.normalize import location_key_variants
 
 st.set_page_config(page_title="Siting — NYC Restaurant Location Intelligence",
@@ -88,12 +90,30 @@ def get_anthropic_api_key() -> str | None:
 def parse_plan_cached(text: str, parser_version: str, model: str,
                       key_present: bool, _api_key: str | None):
     """
-    Identical prompts parse once. The secret itself stays out of the cache
-    key (underscored), but `key_present` is IN it — without that, a fallback
-    parse cached while the key was missing would keep replaying after the
-    key appears, which is exactly the bug this fixes.
+    Identical prompts parse once — Claude runs at most ONCE per submitted
+    plan, and never again for tab changes, map clicks, or navigation. The
+    secret itself stays out of the cache key (underscored), but
+    `key_present` is IN it — without that, a fallback parse cached while
+    the key was missing would keep replaying after the key appears, which
+    is exactly the bug this fixes.
     """
-    return plan_parser.parse_plan(text, _api_key)
+    return plan_parser.parse_plan(text, _api_key,
+                                  known_areas=area_name_lexicon())
+
+
+def simulation_enabled() -> bool:
+    """
+    The validated financial engine stays intact, but the product currently
+    ends at explore -> assess -> compare. Simulation UI is reachable only
+    with an explicit developer flag (secrets ENABLE_SIMULATION, or the
+    session flag the simulation regression tests set).
+    """
+    if st.session_state.get("_enable_sim"):
+        return True
+    try:
+        return bool(st.secrets.get("ENABLE_SIMULATION"))
+    except Exception:
+        return False
 
 
 def google_api_key() -> str | None:
@@ -182,12 +202,72 @@ def area_features_cached(_panel) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def concept_fit_cached(_panel, cuisine: str) -> pd.DataFrame:
+def panel_with_nta_cached(_panel) -> pd.DataFrame:
+    """
+    The panel joined to its 2020 NTA assignment ONCE per session. Area
+    clicks slice this frame instead of re-merging 48k rows on every rerun —
+    measured 29.7ms -> 2.0ms per lookup.
+    """
+    return _panel.merge(nta_assignment(_panel).rename("nta_2020"),
+                        left_on="camis", right_index=True)
+
+
+#: Shape of an empty concept-fit table — returned when no cuisine was given,
+#: so every caller reads "not measured" instead of crashing on an empty frame.
+_EMPTY_FIT = pd.DataFrame(
+    columns=["band", "fit_index", "cohort_n", "cohort_survived",
+             "active_same", "baseline_rate", "baseline_n"],
+    index=pd.Index([], name="nta_code"))
+_EMPTY_DENSITY = pd.DataFrame(
+    columns=["active_same", "density_percentile"],
+    index=pd.Index([], name="nta_2020"))
+
+
+@st.cache_data(show_spinner="Analyzing concept fit…")
+def concept_fit_cached(_panel, cuisine: str | None) -> pd.DataFrame:
+    """Per-NTA concept fit, or an empty (correctly-shaped) table when the
+    plan named no cuisine — concept fit is then simply not measured."""
+    if not cuisine:
+        return _EMPTY_FIT.copy()
     return areas.area_concept_fit(_panel, nta_assignment(_panel), cuisine)
 
 
+@st.cache_data(show_spinner="Analyzing restaurant persistence…")
+def conceptfree_fit_cached(_panel) -> pd.DataFrame:
+    """
+    Concept-INDEPENDENT area table for plans with no cuisine: overall
+    restaurant persistence (2011–17 cohort still listed 2026) versus the
+    citywide rate, on the same Wilson-gated 50-neutral scale as concept
+    fit. Honestly labeled everywhere it renders: this measures restaurants
+    in general, never the user's specific concept.
+    """
+    from nycsiting.stats import rate_differs
+    feats = area_features_cached(_panel)
+    cohort = _panel[_panel["seen_2017"]]
+    city = float(cohort["seen_2026"].mean())
+    rows = []
+    for code, row in feats.iterrows():
+        n, survived = int(row["cohort_n"]), int(row["cohort_survived"])
+        if n < areas.MIN_AREA_SAMPLE:
+            band, index = "Limited evidence", float("nan")
+        else:
+            rate = survived / n
+            gap = rate - city
+            verdict = rate_differs(survived, n, city)
+            index = float(np.clip(
+                areas.FIT_NEUTRAL + gap * areas.FIT_SLOPE, 0, 100))
+            band = ("Strong" if verdict == "above"
+                    else "Promising" if gap > 0 else "Mixed")
+        rows.append(dict(nta_code=code, band=band, fit_index=index,
+                         cohort_n=n, cohort_survived=survived,
+                         baseline_rate=city))
+    return pd.DataFrame(rows).set_index("nta_code")
+
+
 @st.cache_data(show_spinner=False)
-def density_cached(_panel, cuisine: str) -> pd.DataFrame:
+def density_cached(_panel, cuisine: str | None) -> pd.DataFrame:
+    if not cuisine:
+        return _EMPTY_DENSITY.copy()
     return areas.restaurant_density_by_cuisine(
         _panel, nta_assignment(_panel), cuisine)
 
@@ -215,8 +295,100 @@ def evidence_cached(_panel) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def concept_ranking_cached(_panel, nta_code: str) -> list[dict]:
-    return areas.rank_concepts_for_area(_panel, nta_assignment(_panel), nta_code)
+def concept_candidates_cached(_panel) -> list[str]:
+    """Cuisines eligible for concept ranking — same gate as areas.py."""
+    active = _panel[_panel["seen_2026"] & (_panel["cuisine"] != "")]
+    return [c for c, n in active["cuisine"].value_counts().items()
+            if n >= areas.MIN_CITYWIDE_CUISINE]
+
+
+@st.cache_data(show_spinner="Ranking concepts for this area…")
+def concept_ranking_cached(_panel, nta_code: str, top: int = 8) -> list[dict]:
+    """
+    Same candidates, same formula, same ordering as
+    areas.rank_concepts_for_area — but assembled from the per-cuisine fit
+    tables that concept_fit_cached already memoises ACROSS areas. The first
+    area pays to build the tables once; every later area click ranks from
+    cache (measured 1167ms -> 0.5ms).
+    """
+    rows = []
+    for cuisine in concept_candidates_cached(_panel):
+        fit = concept_fit_cached(_panel, cuisine)
+        if nta_code not in fit.index:
+            continue
+        row = fit.loc[nta_code]
+        if row["band"] == "Limited evidence" or row["fit_index"] is None:
+            continue
+        rows.append(dict(cuisine=cuisine, fit_index=float(row["fit_index"]),
+                         band=row["band"], cohort_n=int(row["cohort_n"]),
+                         cohort_survived=int(row["cohort_survived"]),
+                         active_same=int(row["active_same"]),
+                         baseline_rate=float(row["baseline_rate"]),
+                         baseline_n=int(row["baseline_n"])))
+    rows.sort(key=lambda r: -r["fit_index"])
+    return rows[:top]
+
+
+@st.cache_data(show_spinner=False)
+def area_name_lexicon(_names_key: int = 0) -> tuple[str, ...]:
+    """
+    Every neighborhood-name segment the 2020 geography actually maps — the
+    ONLY vocabulary the deterministic parsers may recognize. Residential
+    NTAs only, and no fragments under four characters: hyphen shards of
+    park/cemetery names ("green" from Green-Wood Cemetery, "co" from
+    Co-op City) would otherwise match ordinary prose in a plan.
+    """
+    segments = set()
+    for feature in nta_index().features.values():
+        if not feature["residential"]:
+            continue
+        segments.update(s for s in nta.name_segments(feature["name"])
+                        if len(s) >= 4)
+    return tuple(sorted(segments, key=len, reverse=True))
+
+
+def resolve_area_candidates(text: str, borough: str | None = None
+                            ) -> list[str]:
+    """
+    Deterministic area-name resolution against the app's own geography,
+    candidates ordered by current restaurant inventory (a park polygon or a
+    thinly-mapped namesake never outranks the neighborhood people mean).
+    """
+    names = nta_names()
+    boroughs = {c: f["borough"] for c, f in nta_index().features.items()}
+    codes = nta.resolve_area_name(text, names, boroughs, borough)
+    if len(codes) > 1:
+        feats = area_features_cached(load_panel())
+        codes.sort(key=lambda c: -int(feats.loc[c, "restaurants_active"])
+                   if c in feats.index else 0)
+    return codes
+
+
+@st.cache_data(show_spinner=False)
+def ped_sites_by_nta_cached() -> dict[str, list[float]]:
+    """The 114 DOT bi-annual count sites located ONCE into their NTAs —
+    existing data, the existing point-in-polygon."""
+    out: dict[str, list[float]] = {}
+    for _, row in load_pedestrian().iterrows():
+        code = nta_index().locate(row["lat"], row["lon"])
+        if code:
+            out.setdefault(code, []).append(float(row["count"]))
+    return out
+
+
+def area_ped_context(code: str) -> dict:
+    """
+    DOT bi-annual pedestrian evidence for one NTA. Terciles of the citywide
+    counts give a relative High/Moderate/Low; no site inside means NOT
+    MEASURED — a statement about coverage, never about the area.
+    """
+    inside = ped_sites_by_nta_cached().get(code)
+    if not inside:
+        return {"band": None, "sites": 0}
+    lo, hi = load_pedestrian()["count"].quantile([1 / 3, 2 / 3])
+    peak = max(inside)
+    band = "High" if peak >= hi else ("Moderate" if peak >= lo else "Low")
+    return {"band": band, "sites": len(inside), "peak": peak}
 
 
 def active_theme() -> str:
@@ -349,28 +521,38 @@ def render_history(report: dict) -> None:
 
 
 def render_cuisine(report: dict) -> None:
-    """Compact comparison rows; the statistical reading rules as captions.
-    Rendered inside a collapsed detail expander, so no nested expanders."""
+    """Cuisine track record, in plain words: observed persistence here vs
+    the benchmarks, one read per comparison, no statistics jargon."""
     cuisine = report["query"]["cuisine"]
     comps = report["comparisons"]
     if not comps:
         st.caption(f"No {cuisine} restaurant near here appears in the "
-                   f"2011–2017 archive — no local track record to compare.")
+                   f"historical records — no local track record to compare.")
         return
 
-    glyph = {"below": "↓ lower", "above": "↑ higher",
-             "inconclusive": "≈ not distinguishable"}
+    read = {"below": "Lower", "above": "Higher",
+            "inconclusive": "No clear difference"}
+    labels = {
+        "location_vs_area": "This address vs nearby",
+        "cuisine_vs_area": f"{cuisine} vs other cuisines nearby",
+        "cuisine_vs_city": f"{cuisine} here vs citywide",
+        "area_vs_city": "This area vs citywide",
+    }
     ui.bench_rows([
-        (c["question"].rstrip("?"),
+        (labels.get(c["key"], c["question"].rstrip("?")),
          f"{100*c['subject_rate']:.0f}% vs {100*c['baseline_rate']:.0f}% · "
-         f"{glyph[c['verdict']]}")
+         f"{read[c['verdict']]}")
         for c in comps])
     smallest = min(c["subject_n"] for c in comps)
-    st.caption(
-        f"'Still listed' means a 2011–2017 restaurant appears in the 2026 "
-        f"records — persistence, not profitability. Differences inside the "
-        f"margin of error (smallest sample here: n={smallest}) read as "
-        f"'not distinguishable', never as findings.")
+    st.caption(f"Observed persistence: the share of restaurants in the "
+               f"2011–17 records still listed in 2026. Smallest comparison "
+               f"here rests on {smallest} historical restaurants.")
+    with st.expander("What is observed persistence?"):
+        st.caption("Restaurants present in the 2011–2017 historical records "
+                   "that also appear in the 2026 public record. It measures "
+                   "observed persistence in the datasets, not profitability. "
+                   "\"No clear difference\" means the gap is within the "
+                   "sampling uncertainty for the sample size.")
 
 
 def render_competition(report: dict, site: dict, locations: pd.DataFrame) -> None:
@@ -457,20 +639,41 @@ def render_context(lot: dict | None, ped: dict | None) -> None:
             st.caption(f"{ped['distance_m']:.0f}m from your site · {tag}.")
 
 
-def render_google(landscape, cuisine: str, price: str = "$$") -> None:
+def render_google(landscape, cuisine: str, price: str | None = None,
+                  report=None) -> None:
     """
     Live competition: four numbers and one line by default; ranked rows,
     price mix and the strength methodology one expander away. Failure states
     are one calm line each — the assessment does not depend on this layer.
     """
-    if not landscape.ok:
-        if landscape.reason == "no_key":
-            st.info("Live competitor data is not configured — add a "
-                    "`GOOGLE_MAPS_API_KEY` in `.streamlit/secrets.toml` "
-                    "(see README). The assessment above is unaffected.")
+    if landscape is None or not landscape.ok:
+        if landscape is None:
+            st.info("No cuisine or concept was specified, so there is no "
+                    "live competitor query to run. Public-record inventory "
+                    "below.")
         else:
-            st.info("Live competitor data unavailable. The assessment above "
-                    "is built from public records and is unaffected.")
+            st.info("Live competitor enrichment is temporarily unavailable."
+                    + (" The configured Google key was rejected — check it "
+                       "in Google Cloud."
+                       if landscape.reason == "auth" else ""))
+        # Honest fallback: the public-record inventory still answers the
+        # question, just without live ratings.
+        if report is not None:
+            area = report["area"]
+            if cuisine and cuisine != "restaurant":
+                a, b, c = st.columns(3)
+                a.metric("Similar concepts nearby",
+                         area["active_competitors"])
+                b.metric(f"Exactly {cuisine}", area["active_same_cuisine"])
+                c.metric("Food businesses nearby", area["active_all"])
+            else:
+                # Without a cuisine the same-cuisine counters are zero by
+                # construction — showing them would read as "no competitors
+                # here", which is not what the records say.
+                st.metric("Food businesses nearby", area["active_all"])
+            st.caption("From NYC public records within the site radius — "
+                       "live ratings and review counts return when the "
+                       "Google key is restored.")
         return
 
     if landscape.total == 0:
@@ -502,15 +705,22 @@ def render_google(landscape, cuisine: str, price: str = "$$") -> None:
         if mix:
             priced = sum(mix.values())
             common = max(mix, key=mix.get)
-            same = mix.get(price, 0)
-            st.caption(
-                f"**Your price point: {price}.** Most priced competitors sit "
-                f"at {common} ({mix[common]} of {priced}); {same} are at "
-                f"{price}."
-                + (" You would be pitching where this block already sits."
-                   if common == price else
-                   f" {price} is away from the local norm — an opening or a "
-                   f"mismatch; this data cannot tell you which."))
+            if price:
+                # Only assert "your price point" when the user actually
+                # stated one — a defaulted $$ is not the user's plan.
+                same = mix.get(price, 0)
+                st.caption(
+                    f"**Your price point: {price}.** Most priced competitors "
+                    f"sit at {common} ({mix[common]} of {priced}); {same} "
+                    f"are at {price}."
+                    + (" You would be pitching where this block already "
+                       "sits." if common == price else
+                       f" {price} is away from the local norm — an opening "
+                       f"or a mismatch; this data cannot tell you which."))
+            else:
+                st.caption(
+                    f"**Price mix.** Most priced competitors sit at {common} "
+                    f"({mix[common]} of {priced} with price data).")
 
         ui.competitor_rows([
             dict(name=r["name"],
@@ -553,6 +763,11 @@ def render_google(landscape, cuisine: str, price: str = "$$") -> None:
             "label also needs at least 20 reviews.")
 
 
+#: The no-cuisine sentinel for every cuisine selector. Internally the value
+#: is None — a user who named no cuisine must never inherit the first
+#: taxonomy label.
+CUISINE_ANY = "Any cuisine"
+
 EXAMPLE_PLANS = [
     "Italian restaurant at 195 Bowery, Manhattan",
     "Small coffee shop in 10012 with strong foot traffic",
@@ -572,21 +787,33 @@ def landing_page(panel: pd.DataFrame) -> None:
     st.markdown("Tell us what you're planning.")
     st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
 
-    with st.container(border=True):
+    # A form, deliberately: clicking the submit button commits the textarea
+    # value in the same run. The previous st.text_area + disabled-button pair
+    # only saw the text after a blur or Cmd+Enter — the reported "Continue
+    # needs Cmd+Enter first" bug.
+    with st.form("plan_form", border=True):
         text = st.text_area(
             "Your plan", value=st.session_state.get("plan_text", ""),
             placeholder=("I want to open an upscale Italian restaurant in "
                          "10003. About $70 per person and around 60 seats. "
                          "Good pedestrian activity, not extreme competition."),
             height=110, label_visibility="collapsed")
-        go = st.button("Continue →", type="primary", width="stretch",
-                       disabled=not text.strip())
+        go = st.form_submit_button("Continue →", type="primary",
+                                   width="stretch")
+    if go and not text.strip():
+        st.caption(":orange[Tell us a little about the restaurant you're "
+                   "planning first.]")
+        go = False
     st.caption("Try: " + " · ".join(f"*{e}*" for e in EXAMPLE_PLANS))
 
     if go:
-        # A new plan invalidates everything downstream of the old one.
+        # A new plan invalidates everything downstream of the old one —
+        # including any cuisine, filter, or comparison the last plan left.
         for key in ("plan_outcome", "plan_confirmed", "sim_results",
-                    "sim_location_id", "address", "cuisine"):
+                    "sim_location_id", "address", "cuisine", "ws_concept",
+                    "ws_comp", "_comp_mirror", "comparison_area_ids",
+                    "report_pdf", "confirmed_plan", "selected_area",
+                    "selected_restaurant", "requested_area"):
             st.session_state.pop(key, None)
         st.session_state["plan_text"] = text.strip()
         key = get_anthropic_api_key()
@@ -721,59 +948,57 @@ def _fmt_compact(value: float | None, money: bool = False,
 def render_market(ped: dict | None, verdicts: list[dict],
                   tract: dict | None = None,
                   tract_source: str = "unavailable") -> None:
-    """
-    Local-market detail: 2024 ACS 5-Year tract estimates with NYC-tract
-    percentiles, plus the measured pedestrian context. Hosted in a collapsed
-    expander. Neighbourhood context about residents — never a claim that
-    residents are customers.
-    """
+    """Local market: 2x2 metric grid inside the panel width — never a wide
+    strip, never horizontal scroll. Context about residents, not customers."""
     if tract:
-        def cell(key, money=False, decimals=0):
+        def value_of(key, money=False, decimals=0):
             m = tract.get(key) or {}
             return (_fmt_compact(m.get("value"), money, decimals),
                     m.get("percentile"))
 
-        pop, pop_pct = cell("population")
-        inc, inc_pct = cell("median_household_income", money=True)
-        age, age_pct = cell("median_age", decimals=1)
-        emp, emp_pct = cell("employed_population")
-        rent, rent_pct = cell("median_gross_rent", money=True)
-        ui.stat_strip([
-            (pop, "Population"), (inc, "Median household income"),
-            (age, "Median age"), (emp, "Employed residents"),
-            (rent, "Median gross rent"),
-        ])
-        pct_bits = [f"income {p:.0f}th" if k == "inc" else f"{k} {p:.0f}th"
-                    for k, p in (("population", pop_pct), ("inc", inc_pct),
-                                 ("age", age_pct), ("rent", rent_pct))
-                    if p is not None]
-        source_word = ("Census tract" if tract_source == "census_geocoder"
-                       else "Census tract (borrowed from the nearest listed "
-                            "restaurant)")
-        st.caption(f"2024 ACS 5-Year · {source_word}"
-                   + (" · percentile among NYC tracts: "
-                      + ", ".join(pct_bits) if pct_bits else "")
-                   + ". A dash means the Census suppressed that estimate.")
-        st.caption(":grey[ACS values describe residents of this tract — they "
-                   "do not directly measure restaurant customers.]")
+        pop, _ = value_of("population")
+        inc, inc_pct = value_of("median_household_income", money=True)
+        age, _ = value_of("median_age", decimals=1)
+        emp, _ = value_of("employed_population")
+        r1a, r1b = st.columns(2)
+        r1a.metric("Population", pop)
+        r1b.metric("Income", inc,
+                   help="Median household income for this Census tract")
+        r2a, r2b = st.columns(2)
+        r2a.metric("Median age", age)
+        r2b.metric("Employed", emp)
+        if inc_pct is not None:
+            st.caption(f"Income at the {inc_pct:.0f}th percentile of NYC "
+                       f"tracts.")
+        st.caption("ACS 2024 · Census tract"
+                   + ("" if tract_source == "census_geocoder"
+                      else " (borrowed from the nearest listed restaurant)"))
+        with st.expander("About this data"):
+            st.caption("2024 ACS 5-Year estimates describe residents of the "
+                       "surrounding Census tract — they do not directly "
+                       "measure restaurant customers. A dash means the "
+                       "Census suppressed that estimate.")
     elif load_acs() is None:
-        st.caption("Local demographics are not fetched yet — run "
-                   "`python scripts/fetch_acs_nyc.py` with a CENSUS_API_KEY "
-                   "configured (see README). Five requests, one per borough.")
+        st.caption("Local demographics not fetched yet — run "
+                   "`python scripts/fetch_acs_nyc.py` (see README).")
     else:
         st.caption("No Census tract could be resolved for this address — "
-                   "local demographics are not shown rather than guessed.")
+                   "demographics are not shown rather than guessed.")
 
-    foot = next((v for v in verdicts if v["key"] == "foot_traffic"), None)
+    ui.eyebrow("Pedestrian context")
     if ped:
+        c1, c2 = st.columns(2)
+        c1.metric("Observed pedestrians", f"{ped['count']:,}")
+        c2.metric("Distance", f"{ped['distance_m']:.0f}m",
+                  help=ped["street"])
         tag = ("Measured nearby" if ped.get("represents_this_block")
-               else "Nearby reference — district context, not this doorway")
-        st.caption(f"Pedestrians: {ped['count']:,} counted on {ped['street']}, "
-                   f"{ped['distance_m']:.0f}m away ({ped['period']}). "
-                   f"Bi-annual NYC DOT reference · {tag}.")
+               else "Bi-annual reference")
+        st.caption(f"{ped['street']} · {tag}")
+        with st.expander("About this measure"):
+            st.caption("The nearest NYC DOT counting location — a periodic "
+                       "observed count, not this doorway's live footfall.")
     else:
-        st.caption("No reliable pedestrian measurement is available near "
-                   "this location.")
+        st.caption("No pedestrian measurement available near this location.")
 
 
 def render_recommendation(label: str, headline: str, proceed: dict | None,
@@ -820,7 +1045,8 @@ def render_next(site: dict, cuisine: str, fit: int | None,
                 verdicts: list[dict], landscape) -> None:
     """Step 12: keep the decision moving — or go deeper on this address."""
     st.markdown("### What next?")
-    if st.button("Simulate opening here →", type="primary", width="stretch"):
+    if simulation_enabled() and st.button(
+            "Simulate opening here →", type="primary", width="stretch"):
         # The simulation belongs to THIS address and concept; stamp the pair
         # so stale results can never render for a different query.
         st.session_state["sim_location_id"] = (site["label"], cuisine)
@@ -920,7 +1146,8 @@ def render_methodology(result: dict, radius: int) -> None:
             "and a tax lot |\n"
             "| Google Places (optional) | Who is trading now, ratings and "
             "review volume |\n"
-            "| US Census ACS | *Not currently usable — see below* |\n")
+            "| US Census 2024 ACS 5-Year tracts | Local demographic context "
+            "— population, income and age indicators (details below) |\n")
         st.markdown(
             f"**How the fit score is built.** Six components, each measured "
             f"from public records within {radius}m, combined as a weighted "
@@ -1467,7 +1694,8 @@ def simulate_page(panel, locs) -> None:
             st.session_state["stage"] = "landing"
             st.rerun()
     with top_l:
-        ui.query_context(cuisine, st.session_state.get("price", "$$"), address)
+        ui.query_context(cuisine, st.session_state.get("price") or "—",
+                         address)
 
     try:
         site = geocode_cached(address)
@@ -1585,6 +1813,46 @@ LAYER_CHOICES = {
 }
 
 
+#: Layers that require a cuisine. With no cuisine given, the layer list
+#: simply omits them — concept-independent evidence carries the workspace.
+CUISINE_LAYERS = {"concept_fit", "cuisine_density", "opportunity_gap"}
+
+
+def layer_choices_for(cuisine: str | None) -> dict:
+    if cuisine:
+        return LAYER_CHOICES
+    filtered = {label: key for label, key in LAYER_CHOICES.items()
+                if key not in CUISINE_LAYERS}
+    # Persistence leads when no cuisine is set — it is the default read.
+    ordered = {"Persistence": filtered.pop("Persistence")}
+    ordered.update(filtered)
+    return ordered
+
+
+#: Concept term -> DOHMH-name token for the CLOSEST MATCH tier. Only
+#: concepts whose names actually announce them ("X BRUNCH", "Y COFFEE") are
+#: listed — everything else honestly reads limited concept-level evidence.
+CONCEPT_NAME_TOKENS = {
+    "brunch": "BRUNCH", "coffee": "COFFEE", "cafe": "CAFE",
+    "café": "CAFE", "bakery": "BAKERY", "patisserie": "PATISSERIE",
+    "deli": "DELI", "diner": "DINER", "pizzeria": "PIZZERIA",
+    "steakhouse": "STEAKHOUSE", "izakaya": "IZAKAYA",
+    "wine bar": "WINE", "cocktail": "COCKTAIL", "juice": "JUICE",
+    "tea": "TEA", "sandwich": "SANDWICH", "dessert": "DESSERT",
+}
+
+
+def concept_token(concept: str | None) -> str | None:
+    """The name-matchable token inside the user's concept phrase, if any."""
+    if not concept:
+        return None
+    lowered = concept.lower()
+    for term in sorted(CONCEPT_NAME_TOKENS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(term)}\b", lowered):
+            return CONCEPT_NAME_TOKENS[term]
+    return None
+
+
 def _hover_frame(panel) -> pd.DataFrame:
     names = nta_names()
     return pd.DataFrame({"name": pd.Series(names)})
@@ -1598,25 +1866,19 @@ def zip_to_nta(_panel, zipcode: str) -> str | None:
     ZIPs — verified live, it resolves "10003" to 10003 Springfield Boulevard
     in Queens Village, the exact silent mis-placement this avoids.
     """
-    assignment = nta_assignment(_panel)
-    merged = _panel.merge(assignment.rename("nta_2020"), left_on="camis",
-                          right_index=True)
+    merged = panel_with_nta_cached(_panel)
     counts = merged[merged["zipcode"] == zipcode]["nta_2020"].value_counts()
     return counts.index[0] if len(counts) else None
 
 
-def neighborhood_to_nta(name: str) -> str | None:
-    """Name -> NTA code: exact match first, then unique containment."""
-    if not name:
-        return None
-    wanted = name.strip().lower()
-    names = nta_names()
-    exact = [c for c, n in names.items() if n.lower() == wanted]
-    if exact:
-        return exact[0]
-    contains = [c for c, n in names.items()
-                if wanted in n.lower() or n.lower() in wanted]
-    return contains[0] if len(contains) == 1 else None
+def neighborhood_to_nta(name: str, borough: str | None = None) -> str | None:
+    """
+    Name -> best-candidate NTA code via the deterministic resolver. A name
+    that maps to several areas returns the inventory-leading one here; the
+    confirm page is where the alternatives are surfaced for the user.
+    """
+    codes = resolve_area_candidates(name or "", borough)
+    return codes[0] if codes else None
 
 
 def polygon_bounds(code: str) -> tuple[float, float, float, float]:
@@ -1642,35 +1904,129 @@ def select_area(code: str) -> None:
     st.session_state.pop("selected_restaurant", None)
 
 
-def area_restaurants(panel, code: str, cuisine: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+@st.cache_data(show_spinner=False)
+def area_tiers_cached(_panel, code: str, cuisine: str | None,
+                      concept: str | None) -> dict:
     """
-    (similar, other) CURRENT establishments inside one NTA — spatial
-    membership from the precomputed point-in-polygon assignment, one marker
-    per CAMIS, never inspection rows.
+    Tiers computed ONCE per area+concept and then filtered locally — the
+    Closest / Similar / All control never recomputes anything (spec 68).
     """
-    assignment = nta_assignment(panel)
-    merged = panel.merge(assignment.rename("nta_2020"), left_on="camis",
-                         right_index=True)
+    return area_restaurant_tiers(_panel, code, cuisine, concept)
+
+
+def area_restaurant_tiers(panel, code: str, cuisine: str | None,
+                          concept: str | None = None) -> dict:
+    """
+    CURRENT establishments inside one NTA, split into three honesty-graded
+    tiers — one marker per CAMIS, never inspection rows:
+
+    closest — the highest specificity CURRENT data supports: the exact
+        DOHMH cuisine label, narrowed to name-announced concept matches
+        ("BRUNCH", "COFFEE") when the user named a concept the records can
+        actually identify. When they can't, `note` says so — never a fake
+        exact match.
+    similar — the concept's competitive set (the V5/V6 similar tier).
+    other — everything else in the area.
+    """
+    merged = panel_with_nta_cached(panel)
     inside = merged[(merged["nta_2020"] == code) & merged["seen_2026"]
                     & merged["lat"].notna()]
-    compset = cuisines.competitive_set(cuisine)
-    similar = inside[inside["cuisine"].isin(compset)]
-    other = inside[~inside["cuisine"].isin(compset)]
-    return similar, other
+    token = concept_token(concept)
+    note = None
+    #: True when current records cannot identify the concept AT ALL, so the
+    #: closest tier is unmeasurable rather than empty — the difference
+    #: between "none here" and "we cannot tell", which must never be
+    #: reported as a measured zero.
+    unidentifiable = False
+
+    if cuisine:
+        compset = cuisines.competitive_set(cuisine)
+        exact = inside[inside["cuisine"] == cuisine]
+        if token is not None:
+            named = exact[exact["name"].str.upper().str.contains(
+                rf"\b{token}\b", regex=True, na=False)]
+            if len(named):
+                closest = named
+                note = (f"Name-identified {token.lower()} concepts among "
+                        f"{cuisine} listings — public records don't "
+                        f"classify concepts, so this is indicative.")
+            else:
+                closest = exact
+                note = (f"Limited exact-concept evidence: current records "
+                        f"identify {cuisine} restaurants reliably but not "
+                        f"which operate as {concept} concepts.")
+        else:
+            closest = exact
+        similar = inside[inside["cuisine"].isin(compset)
+                         & ~inside.index.isin(closest.index)]
+    else:
+        # No cuisine: closest = name-announced concept matches area-wide;
+        # there is no defensible "similar" set without a cuisine.
+        if token is not None:
+            closest = inside[inside["name"].str.upper().str.contains(
+                rf"\b{token}\b", regex=True, na=False)]
+            if not len(closest):
+                unidentifiable = True
+                note = (f"No establishment in this area announces "
+                        f"“{token.lower()}” in its public-record name — "
+                        f"concept-level evidence is limited here, so every "
+                        f"restaurant is shown instead.")
+            else:
+                note = (f"Name-identified {token.lower()} concepts — "
+                        f"public records don't classify concepts, so this "
+                        f"is indicative, not exhaustive.")
+        else:
+            closest = inside.iloc[0:0]
+            unidentifiable = True
+            if concept:
+                note = (f"Current records cannot identify “{concept}” "
+                        f"establishments — showing all restaurants instead.")
+        similar = inside.iloc[0:0]
+
+    other = inside[~inside.index.isin(closest.index)
+                   & ~inside.index.isin(similar.index)]
+    return dict(closest=closest, similar=similar, other=other, note=note,
+                unidentifiable=unidentifiable, total=len(inside))
+
+
+def area_restaurants(panel, code: str, cuisine: str | None
+                     ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Back-compat two-way split: (similar-or-closest, other)."""
+    tiers = area_restaurant_tiers(panel, code, cuisine)
+    grouped = pd.concat([tiers["closest"], tiers["similar"]])
+    return grouped, tiers["other"]
 
 
 def _apply_map_selection(event, panel) -> None:
-    """One handler for every map click: polygons select areas, restaurant
+    """
+    One handler for every map click: polygons select areas, restaurant
     points select restaurants. Top-match buttons call select_area directly,
-    so both paths share the same state transition."""
+    so both paths share the same state transition.
+
+    A plotly selection is STICKY widget state: while the figure spec is
+    unchanged, the exact same event is re-delivered on every rerun. Without
+    the handled-snapshot guard, acting on it unconditionally is an infinite
+    st.rerun() loop (each rerun re-handles the event before the panel ever
+    renders) — and popping selected_restaurant elsewhere would bounce
+    straight back here. Handle each distinct selection exactly once.
+    """
     if not event or not event.get("selection"):
         return
     points = event["selection"].get("points") or []
+    if not points:
+        return
+    snapshot = repr(points)
+    if st.session_state.get("_map_sel_handled") == snapshot:
+        return
+    st.session_state["_map_sel_handled"] = snapshot
     for point in points:
         custom = point.get("customdata")
-        if isinstance(custom, (list, tuple)) and custom and                 str(custom[0]).startswith("camis:"):
-            st.session_state["selected_restaurant"] = str(custom[0])[6:]
-            st.rerun()
+        if isinstance(custom, (list, tuple)) and custom and \
+                str(custom[0]).startswith("camis:"):
+            camis = str(custom[0])[6:]
+            if st.session_state.get("selected_restaurant") != camis:
+                st.session_state["selected_restaurant"] = camis
+                st.rerun()
         location = point.get("location")
         if location and location in nta_index().features:
             if st.session_state.get("selected_area") != location:
@@ -1681,42 +2037,85 @@ def _apply_map_selection(event, panel) -> None:
 def render_map_workspace(panel, site, cuisine: str, landscape,
                          report, mode: str = "site",
                          top_matches: list | None = None) -> None:
-    """The persistent map: toolbar, one layer figure, selection handling."""
-    top1, top2, top3 = st.columns([1.1, 1.5, 1])
+    """The persistent map: toolbar, one layer figure, selection handling.
+    Concept changes are synced in main() BEFORE analysis runs, so a change
+    here costs one rerun, not two. Every keyed control is mirrored into a
+    plain session key: Streamlit drops keyed-widget state for widgets that
+    skip a run (e.g. while the Method view is open), and the mirror re-seeds
+    them so layer/filter selections survive any navigation."""
+    if mode == "site":
+        top1, top2, top3, top4 = st.columns([1.05, 1.35, 0.95, 0.95])
+    else:
+        top1, top2, top3 = st.columns([1.1, 1.5, 1])
+        top4 = None
     with top1:
-        options = cuisine_options(panel)
-        idx = options.index(cuisine) if cuisine in options else 0
-        new_cuisine = st.selectbox("Concept", options, index=idx,
-                                   key="ws_concept")
-        if new_cuisine != cuisine:
-            st.session_state["cuisine"] = new_cuisine
-            for k in ("sim_results", "sim_location_id",
-                      "selected_restaurant"):
-                st.session_state.pop(k, None)
-            st.rerun()
+        options = [CUISINE_ANY] + cuisine_options(panel)
+        if st.session_state.get("ws_concept") not in options:
+            st.session_state["ws_concept"] = (cuisine if cuisine in options
+                                              else CUISINE_ANY)
+        st.selectbox("Concept", options, key="ws_concept")
     with top2:
-        layer_label = st.selectbox("Layer", list(LAYER_CHOICES),
-                                   key="ws_layer")
+        choices = layer_choices_for(cuisine)
+        if st.session_state.get("ws_layer") not in choices:
+            mirrored = st.session_state.get("_layer_mirror")
+            st.session_state["ws_layer"] = (mirrored if mirrored in choices
+                                            else list(choices)[0])
+        layer_label = st.selectbox("Layer", list(choices), key="ws_layer")
+        st.session_state["_layer_mirror"] = layer_label
     with top3:
-        comp_mode = st.radio("Competitors", ["Similar", "All"],
-                             horizontal=True, key="ws_comp",
-                             label_visibility="collapsed")
+        comp_options = (["Closest", "Similar", "All"] if cuisine
+                        else ["Closest", "All"])
+        fallback = "Similar" if cuisine else "All"
+        if st.session_state.get("ws_comp") not in comp_options:
+            mirrored = st.session_state.get("_comp_mirror")
+            st.session_state["ws_comp"] = (mirrored if mirrored
+                                           in comp_options else fallback)
+        comp_mode = st.radio("Restaurants", comp_options,
+                             horizontal=True, key="ws_comp")
+        # Only remember a real choice: writing back the coerced fallback
+        # would permanently downgrade "Similar" after a no-cuisine detour.
+        if comp_mode != fallback or st.session_state.get(
+                "_comp_mirror") in (None, comp_mode):
+            st.session_state["_comp_mirror"] = comp_mode
+    if top4 is not None:
+        with top4:
+            # Keyed widget: the new value is in session state BEFORE the
+            # next run's analysis reads it — no one-rerun lag.
+            if "ws_radius" not in st.session_state:
+                st.session_state["ws_radius"] = st.session_state.get(
+                    "_radius_mirror", config.DEFAULT_RADIUS_M)
+            st.slider("Radius (m)", 200, 1500, key="ws_radius", step=50)
+            st.session_state["_radius_mirror"] = \
+                st.session_state["ws_radius"]
 
     layer = LAYER_CHOICES[layer_label]
     geojson = nta_geojson()
     hover = _hover_frame(panel)
     selected_area = st.session_state.get("selected_area")
 
-    # --- fitBounds: selected area > exact site > citywide ------------------
+    # --- fitBounds: exactly once per NEW selection, then the view holds ----
+    # plotly's uirevision preserves the user's pan/zoom across Streamlit
+    # reruns; changing the revision key applies the computed fit. Without
+    # this, every rerun (marker hover, tab click) snapped the view back —
+    # the reported "clicking sometimes doesn't zoom" and jumpy-map bugs.
     if selected_area:
         center, zoom = zoom_for_bounds(polygon_bounds(selected_area))
+        view_key = f"area:{selected_area}"
     elif site is not None:
         center, zoom = (site["lat"], site["lon"]), 13.6
+        view_key = f"site:{site['label']}"
     else:
         center, zoom = (40.72, -73.97), 9.9
+        view_key = "nyc"
+    st.session_state["last_fitted_area"] = view_key
 
+    # Restaurant markers are the point of a selected-area view: mute the
+    # thematic fill under them so points stay readable (spec section 32).
     fig = _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
-                        site, report)
+                        site, report,
+                        fill_scale=0.5 if selected_area else 1.0)
+    fig.update_layout(uirevision=view_key,
+                      mapbox_uirevision=view_key)
 
     # --- selection emphasis -------------------------------------------------
     if selected_area:
@@ -1728,25 +2127,48 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
                 lat=lats, lon=lons, mode="lines",
                 line=dict(width=2.5, color=workspace_map.TOKENS["accent"]),
                 hoverinfo="skip", showlegend=False))
-        similar, other = area_restaurants(panel, selected_area, cuisine)
-        if comp_mode == "All" and len(other):
+        plan = st.session_state.get("confirmed_plan")
+        tiers = area_tiers_cached(panel, selected_area, cuisine,
+                                  plan.concept if plan else None)
+        # When the concept cannot be identified at all, "Closest" would
+        # otherwise draw an empty map while the caption promises every
+        # restaurant — show them, exactly as the caption says.
+        show_other = (comp_mode == "All"
+                      or (comp_mode == "Closest" and tiers["unidentifiable"]))
+        workspace_map.add_restaurant_markers(
+            fig,
+            tiers["similar"] if comp_mode in ("Similar", "All") else
+            tiers["similar"].iloc[0:0],
+            tiers["other"], show_other=show_other,
+            closest=tiers["closest"])
+        if tiers["note"]:
+            # Shown in every mode: the caveat describes the tier itself,
+            # not the current filter, and hiding it in the default mode
+            # left "Closest match" looking like a verified concept match.
+            st.caption(tiers["note"])
+
+    # Areas queued for comparison get numbered amber outlines — visually
+    # obvious, thematic fill intact, never overpowering restaurant markers.
+    for rank, ccode in enumerate(
+            st.session_state.get("comparison_area_ids", []), 1):
+        cset = nta_index().features.get(ccode)
+        if not cset:
+            continue
+        for poly in cset["polygons"]:
+            lons = [pt[0] for pt in poly[0]] + [poly[0][0][0]]
+            lats = [pt[1] for pt in poly[0]] + [poly[0][0][1]]
             fig.add_trace(go.Scattermapbox(
-                lat=other["lat"], lon=other["lon"], mode="markers",
-                marker=dict(size=6, color=workspace_map.TOKENS["muted"],
-                            opacity=0.45),
-                name=f"Other restaurants ({len(other)})",
-                customdata=[[f"camis:{c}"] for c in other["camis"]],
-                text=other["name"].str.title() + " · " +
-                     other["cuisine"].replace("", "unspecified"),
-                hovertemplate="%{text}<extra></extra>"))
-        if len(similar):
-            fig.add_trace(go.Scattermapbox(
-                lat=similar["lat"], lon=similar["lon"], mode="markers",
-                marker=dict(size=10, color=workspace_map.TOKENS["accent"]),
-                name=f"Similar ({len(similar)})",
-                customdata=[[f"camis:{c}"] for c in similar["camis"]],
-                text=similar["name"].str.title() + " · " + similar["cuisine"],
-                hovertemplate="%{text}<extra></extra>"))
+                lat=lats, lon=lons, mode="lines",
+                line=dict(width=2, color=workspace_map.TOKENS["warn"]),
+                hoverinfo="skip", showlegend=False))
+        x0, y0, x1, y1 = cset["bbox"]
+        fig.add_trace(go.Scattermapbox(
+            lat=[(y0 + y1) / 2], lon=[(x0 + x1) / 2], mode="text",
+            text=[str(rank)],
+            textfont=dict(size=18, color=workspace_map.TOKENS["warn"]),
+            hovertemplate=f"Comparison #{rank}: "
+                          f"{nta_names().get(ccode, ccode)}"
+                          "<extra></extra>", showlegend=False))
 
     if top_matches:
         for rank, match in enumerate(top_matches[:3], 1):
@@ -1763,17 +2185,17 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
                     showlegend=poly is fset["polygons"][0],
                     hoverinfo="skip"))
 
-    if site is not None:
-        fig.add_trace(go.Scattermapbox(
-            lat=[site["lat"]], lon=[site["lon"]], mode="markers",
-            marker=dict(size=16, color="#FFFFFF"),
-            name="Selected site",
-            hovertemplate=f"<b>{site['label']}</b><br>Selected site"
-                          "<extra></extra>"))
+    # Competitors first, then the site marker — the selected site draws on
+    # top. The competition layer's mapview figure already carries its own
+    # site marker; adding a second would double it.
     if (site is not None and landscape is not None
             and getattr(landscape, "ok", False) and comp_mode == "Similar"
             and not selected_area):
         fig = workspace_map.competitor_markers(fig, landscape.competitors)
+    if site is not None and not (layer == "competition"
+                                 and report is not None):
+        workspace_map.add_site_marker(fig, site["lat"], site["lon"],
+                                      site["label"])
 
     event = st.plotly_chart(fig, width="stretch", key="ws_map",
                             on_select="rerun",
@@ -1782,11 +2204,14 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
 
 
 def _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
-                  site, report):
+                  site, report, fill_scale: float = 1.0):
+    if not cuisine and layer in CUISINE_LAYERS:
+        layer = "persistence"
     if layer == "concept_fit":
         fit = concept_fit_cached(panel, cuisine)
         return workspace_map.band_choropleth(
-            geojson, fit["band"], "concept_fit", hover, center, zoom)
+            geojson, fit["band"], "concept_fit", hover, center, zoom,
+            fill_scale=fill_scale)
     if layer == "opportunity_gap":
         fit = concept_fit_cached(panel, cuisine)
         dens = density_cached(panel, cuisine)
@@ -1799,26 +2224,28 @@ def _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
             bands[code] = areas.opportunity_gap(
                 fit.loc[code, "band"], sat["band"])["band"]
         return workspace_map.band_choropleth(
-            geojson, pd.Series(bands), "opportunity_gap", hover, center, zoom)
+            geojson, pd.Series(bands), "opportunity_gap", hover, center, zoom,
+            fill_scale=fill_scale)
     if layer == "turnover":
         return workspace_map.band_choropleth(
             geojson, turnover_cached(panel)["band"], "turnover", hover,
-            center, zoom)
+            center, zoom, fill_scale=fill_scale)
     if layer == "evidence":
         return workspace_map.band_choropleth(
             geojson, evidence_cached(panel)["band"], "evidence", hover,
-            center, zoom)
+            center, zoom, fill_scale=fill_scale)
     if layer == "cuisine_density":
         dens = density_cached(panel, cuisine)
         return workspace_map.continuous_choropleth(
             geojson, dens["active_same"].astype(float),
-            f"{cuisine} (active)", center=center, zoom=zoom)
+            f"{cuisine} (active)", center=center, zoom=zoom,
+            fill_scale=fill_scale)
     if layer == "persistence":
         feats = area_features_cached(panel)
         return workspace_map.continuous_choropleth(
             geojson, (feats["persistence_rate"] * 100).round(0),
             "Still listed (%)", hover_fmt="%{z:.0f}%", center=center,
-            zoom=zoom)
+            zoom=zoom, fill_scale=fill_scale)
     if layer in ("population", "income_context"):
         _, demo = acs_by_nta_cached()
         if demo is None:
@@ -1828,7 +2255,8 @@ def _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
         column = "population" if layer == "population" else "income_context"
         title = "Residents" if layer == "population" else "Income context ($)"
         return workspace_map.continuous_choropleth(
-            geojson, demo[column], title, center=center, zoom=zoom)
+            geojson, demo[column], title, center=center, zoom=zoom,
+            fill_scale=fill_scale)
     if layer == "pedestrian":
         ped_sites = load_pedestrian()
         fig = workspace_map.band_choropleth(
@@ -1848,9 +2276,16 @@ def _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
         return mapview.build_map(everything, site, cuisine, compset,
                                  report["query"]["radius_m"], mode="status",
                                  theme=active_theme(), locations=None)
+    if not cuisine:
+        feats = area_features_cached(panel)
+        return workspace_map.continuous_choropleth(
+            geojson, (feats["persistence_rate"] * 100).round(0),
+            "Still listed (%)", hover_fmt="%{z:.0f}%", center=center,
+            zoom=zoom, fill_scale=fill_scale)
     fit = concept_fit_cached(panel, cuisine)
     return workspace_map.band_choropleth(
-        geojson, fit["band"], "concept_fit", hover, center, zoom)
+        geojson, fit["band"], "concept_fit", hover, center, zoom,
+        fill_scale=fill_scale)
 
 
 def site_area_context(panel, site: dict, cuisine: str, landscape) -> dict:
@@ -1872,6 +2307,671 @@ def site_area_context(panel, site: dict, cuisine: str, landscape) -> dict:
     gap = areas.opportunity_gap(fit_band, saturation["band"])
     return {"nta_code": code, "nta_name": nta_names().get(code, code),
             "fit_band": fit_band, "saturation": saturation, "gap": gap}
+
+
+# ------------------------------------------------------- plan-driven display
+#: RestaurantPlan fields -> how the deterministic app actually uses them.
+#: Fields without a defensible current-data signal say so honestly — they
+#: are retained as context, never fake-scored (V6 spec sections 60/68).
+PLAN_FIELD_USAGE = {
+    "cuisine": "concept fit, similar competitors, cuisine density, "
+               "cuisine track record, concept map layers",
+    "concept": "kept as concept context on the confirmation and plan chips",
+    "address": "site analysis routing, geocoded once, map focus",
+    "zipcode": "area routing via that ZIP's restaurant records",
+    "borough": "discovery constraint and area-name disambiguation",
+    "neighborhood": "area analysis routing and map focus",
+    "average_spend": "kept as concept context — not scored against any "
+                     "dataset",
+    "seats": "kept as concept context — not scored",
+    "price_positioning": "competitor price comparison context",
+    "foot_traffic_preference": "compared with DOT pedestrian evidence "
+                               "where measured",
+    "competition_tolerance": "compared with comparable-restaurant density",
+    "income_preference": "compared with ACS area income context",
+    "restaurant_density_preference": "compared with cuisine density "
+                                     "percentile",
+    "target_customer_description": "kept as plan context — the current "
+                                   "data cannot score it",
+    "additional_constraints": "kept as plan context — not scored",
+}
+
+_LEVEL_WORD = {"low": "Low", "moderate": "Moderate", "high": "High"}
+
+
+def plan_chip_values(plan, area_name: str | None = None,
+                     site_label: str | None = None) -> list[str]:
+    """Compact YOUR PLAN chips — only values the user explicitly provided,
+    never hidden defaults."""
+    if plan is None:
+        return []
+    chips = []
+    if plan.cuisine:
+        chips.append(plan.cuisine)
+    if plan.concept:
+        chips.append(plan.concept.title() if plan.concept.islower()
+                     else plan.concept)
+    if not plan.cuisine:
+        chips.append("Cuisine · Not specified")
+    place = site_label or area_name or plan.zipcode or plan.borough
+    if place:
+        chips.append(place)
+    if plan.average_spend:
+        chips.append(f"~${plan.average_spend:.0f}/person")
+    if plan.seats:
+        chips.append(f"{plan.seats} seats")
+    if plan.price_positioning:
+        chips.append(plan.price_positioning)
+    if plan.foot_traffic_preference:
+        chips.append(f"{_LEVEL_WORD[plan.foot_traffic_preference]} foot "
+                     f"traffic")
+    if plan.competition_tolerance:
+        chips.append("Prefer lower competition"
+                     if plan.competition_tolerance == "low" else
+                     f"{_LEVEL_WORD[plan.competition_tolerance]} competition "
+                     f"tolerance")
+    if plan.income_preference:
+        chips.append(f"{_LEVEL_WORD[plan.income_preference]}-income area")
+    if plan.restaurant_density_preference:
+        chips.append(f"{_LEVEL_WORD[plan.restaurant_density_preference]} "
+                     f"restaurant density")
+    return chips[:7]
+
+
+def _tercile_band(percentile: float | None) -> str | None:
+    if percentile is None or not np.isfinite(percentile):
+        return None
+    return ("High" if percentile >= 200 / 3
+            else "Moderate" if percentile >= 100 / 3 else "Low")
+
+
+@st.cache_data(show_spinner=False)
+def income_percentile_cached(code: str) -> float | None:
+    """Area income context as a percentile among NTAs with ACS coverage."""
+    _, demo = acs_by_nta_cached()
+    if demo is None or code not in demo.index:
+        return None
+    value = demo.loc[code, "income_context"]
+    valid = demo["income_context"].dropna()
+    if pd.isna(value) or not len(valid):
+        return None
+    return float((valid < value).mean() * 100)
+
+
+def preference_alignment(plan, saturation_band: str | None,
+                         income_pct: float | None,
+                         density_pct: float | None,
+                         ped_band: str | None) -> list[dict]:
+    """
+    Explicit preferences vs. measured relative signals — pure and
+    deterministic, entirely separate from the validated core scores.
+    Statuses: match / mixed / conflict / unmeasured. Nothing unstated is
+    ever included; nothing unmeasured is ever scored.
+    """
+    if plan is None:
+        return []
+
+    def level_vs_band(pref: str, band: str | None) -> str:
+        if band is None:
+            return "unmeasured"
+        gap = abs(("low", "moderate", "high").index(pref)
+                  - ("Low", "Moderate", "High").index(band))
+        return ("match", "mixed", "conflict")[gap]
+
+    rows = []
+    if plan.foot_traffic_preference:
+        status = level_vs_band(plan.foot_traffic_preference, ped_band)
+        rows.append(dict(
+            key="foot_traffic", label="Foot traffic", status=status,
+            measured=ped_band,
+            detail=(f"You asked for {plan.foot_traffic_preference} foot "
+                    f"traffic; " +
+                    (f"the busiest measured DOT count site in this area "
+                     f"reads {ped_band.lower()} relative to the 114 "
+                     f"citywide sites."
+                     if ped_band else
+                     "no DOT count site falls in this area — pedestrian "
+                     "evidence is not measured here."))))
+    if plan.competition_tolerance:
+        if saturation_band is None:
+            status = "unmeasured"
+        elif plan.competition_tolerance == "high":
+            status = "match"
+        else:
+            order = ("Low", "Moderate", "High").index(saturation_band)
+            limit = ("low", "moderate", "high").index(
+                plan.competition_tolerance)
+            status = ("match" if order <= limit
+                      else "conflict" if order - limit > 1 else "mixed")
+        rows.append(dict(
+            key="competition", label="Competition", status=status,
+            measured=saturation_band,
+            detail=(f"You preferred "
+                    f"{plan.competition_tolerance} competition; comparable "
+                    f"restaurant density here is "
+                    f"{saturation_band.lower() if saturation_band else 'not measured'}.")))
+    if plan.income_preference:
+        band = _tercile_band(income_pct)
+        rows.append(dict(
+            key="income", label="Income context",
+            status=level_vs_band(plan.income_preference, band),
+            measured=band,
+            detail=(f"You asked for a {plan.income_preference}-income area; "
+                    + (f"ACS income context here is {band.lower()} relative "
+                       f"to NYC areas." if band else
+                       "ACS income context is unavailable here."))))
+    if plan.restaurant_density_preference:
+        band = _tercile_band(density_pct)
+        rows.append(dict(
+            key="density", label="Restaurant density",
+            status=level_vs_band(plan.restaurant_density_preference, band),
+            measured=band,
+            detail=(f"You asked for {plan.restaurant_density_preference} "
+                    f"restaurant density; this area reads "
+                    + (f"{band.lower()} for your concept."
+                       if band else "unmeasured."))))
+    return rows
+
+
+_PRIORITY_MARK = {"match": ("✓", "good"), "mixed": ("~", "neutral"),
+                  "conflict": ("✕", "concern"), "unmeasured": ("—", "unknown")}
+
+
+def render_priorities(plan, alignment: list[dict], cuisine: str,
+                      area_name: str | None) -> None:
+    """MATCHES YOUR PRIORITIES — stated preferences only, max ~5 rows,
+    entirely separate from the validated core scores (spec section 63)."""
+    if plan is None:
+        return
+    rows = []
+    if area_name:
+        rows.append(("Area", f"✓ {area_name}"))
+    if plan.cuisine:
+        rows.append(("Cuisine", f"✓ {cuisine} analysis"))
+    for r in alignment[:3]:
+        mark, _tone = _PRIORITY_MARK[r["status"]]
+        word = {"match": "Matches", "mixed": "Mixed",
+                "conflict": "Conflicts", "unmeasured": "Not measured"}[
+            r["status"]]
+        state = (f"{mark} {word}" if not r.get("measured")
+                 else f"{mark} {word} · {r['measured']}")
+        rows.append((r["label"], state))
+    if plan.average_spend or plan.price_positioning:
+        rows.append(("Price context", "— Not directly scored"))
+    if not rows:
+        return
+    ui.eyebrow("Matches your priorities")
+    ui.bench_rows(rows[:5])
+    conflicts = [r["detail"] for r in alignment if r["status"] == "conflict"]
+    for line in conflicts[:2]:
+        st.caption(line)
+
+
+def render_plan_usage(plan) -> None:
+    """How your plan was used — one row per PROVIDED field, from the
+    deterministic mapping table. Unsupported details are named as context,
+    never fake-scored."""
+    if plan is None:
+        return
+    with st.expander("How your plan was used"):
+        rows = []
+        for field, usage in PLAN_FIELD_USAGE.items():
+            value = getattr(plan, field, None)
+            if value in (None, "", []):
+                continue
+            shown = ", ".join(value) if isinstance(value, list) else value
+            rows.append((str(shown)[:40], usage))
+        ui.bench_rows(rows)
+        st.caption("Claude only converts your wording into these fields. "
+                   "Every comparison above comes from the app's own "
+                   "datasets.")
+
+
+# --------------------------------------------------------------- concepts
+def _label_artifact(row: dict) -> bool:
+    """
+    A citywide cohort that "survived" wholesale is a label DOHMH introduced
+    with the 2026 vocabulary: every carrier is seen_2026 by construction.
+    Straight renames are repaired upstream (cuisines.DOHMH_2017_TO_2026),
+    so what remains here are genuinely new categories with no 2017
+    counterpart — New American, Vegan, Fusion and the like. The fit index
+    self-neutralizes to 50 for these — but the raw rate must never be
+    presented as a genuine persistence read.
+    """
+    return row.get("baseline_rate", 0) >= 0.999
+
+
+def concept_reason(row: dict, sat_band: str | None) -> str:
+    """Short reason from signals the fit computation ACTUALLY used, plus the
+    separately-computed competition context. Never an invented explanation."""
+    if _label_artifact(row):
+        persistence = "Category label changed between extracts — " \
+                      "persistence comparison uninformative"
+    else:
+        persistence = {
+            "Strong": "Strong local track record",
+            "Promising": "Above-baseline observed persistence",
+            "Mixed": "At or below the citywide baseline",
+        }.get(row["band"], "Limited local history")
+    competition = (f"{sat_band.lower()} comparable competition"
+                   if sat_band else "competition unmeasured")
+    return f"{persistence} · {competition}"
+
+
+def render_concept_rows(panel, code: str, ranking: list[dict],
+                        limit: int = 3, own_concept: bool = False) -> None:
+    """Concept ranking — each with score, band, reason, and a Why?
+    breakdown built from the actual area_concept_fit components. When the
+    user searched their OWN concept this renders as the secondary "other
+    concepts" module, never upstaging what they actually asked about."""
+    if not ranking:
+        return
+    ui.eyebrow("Other concepts that fit here" if own_concept
+               else "Concepts that fit this area")
+    st.caption(("Relative alternative-concept scores under this area's "
+                "evidence — they do not mean those cuisines have a 100% "
+                "probability of success. Your own concept stays the "
+                "primary analysis above. "
+                if own_concept else "")
+               + "Ranks cuisines using the same local evidence framework. "
+                 "Higher scores indicate a stronger relative match — not a "
+                 "probability of success.")
+    for i, r in enumerate(ranking[:limit], 1):
+        dens = density_cached(panel, r["cuisine"])
+        sat = areas.competitor_saturation(
+            int(dens.loc[code, "active_same"]) if code in dens.index else 0,
+            float(dens.loc[code, "density_percentile"])
+            if code in dens.index else None)
+        score = f"{r['fit_index']:.0f}"
+        band_label = ("Top relative fit" if r["fit_index"] >= 100
+                      else f"{r['band']} relative fit")
+        st.markdown(
+            f"**{i}. {r['cuisine']}** — {score} / 100 · {band_label}  \n"
+            f"<span style='font-size:13px;color:var(--text-muted);'>"
+            f"{concept_reason(r, sat['band'])}</span>",
+            unsafe_allow_html=True)
+        with st.expander("Why?", expanded=False):
+            local_rate = (r["cohort_survived"] / r["cohort_n"]
+                          if r["cohort_n"] else float("nan"))
+            gap = local_rate - r["baseline_rate"]
+            ui.bench_rows([
+                ("Local still-listed (2011–17 → 2026)",
+                 f"{r['cohort_survived']}/{r['cohort_n']} "
+                 f"= {local_rate:.0%}"),
+                ("Same set citywide",
+                 f"{r['baseline_rate']:.0%} (n={r['baseline_n']:,})"),
+                ("Observed persistence gap", f"{gap * 100:+.1f} pts"),
+                ("Fit index",
+                 f"{areas.FIT_NEUTRAL} + ({gap:+.3f}) × {areas.FIT_SLOPE} "
+                 f"→ {r['fit_index']:.0f} (clipped 0–100)"),
+                ("Local sample",
+                 f"{r['cohort_n']} (min {areas.MIN_CUISINE_SAMPLE})"),
+                ("Comparable competition",
+                 (sat["band"] or "Unmeasured")
+                 + (f" · {sat['density_percentile']:.0f}th pct"
+                    if sat.get("density_percentile") is not None else "")),
+            ])
+            if r["band"] == "Promising":
+                st.caption("Promising = above the citywide baseline but "
+                           "within sampling uncertainty — directional, not "
+                           "statistically established. Strong requires the "
+                           "sample to clear the margin.")
+            if r["fit_index"] >= 100:
+                st.caption("100 marks the top of the current relative scale "
+                           "for this area's available evidence — several "
+                           "concepts can share it, and it does not mean a "
+                           "100% probability of success.")
+            if _label_artifact(r):
+                st.caption("This DOHMH category exists only under a newer "
+                           "label, so every record carrying it is in the "
+                           "2026 extract by construction — the 100% rates "
+                           "are a labelling artifact, not restaurant "
+                           "longevity, and the comparison is neutral.")
+            st.caption("Competition is shown for context; the fit index "
+                       "itself is the observed-persistence comparison "
+                       "above.")
+
+
+# ------------------------------------------------------------- comparison
+def google_concept_query(cuisine: str | None, concept: str | None) -> str | None:
+    """Deterministic Google text query from EXPLICIT plan fields only —
+    'Italian brunch', 'French bakery', 'brunch'. None when neither given."""
+    parts = [p.strip() for p in (cuisine, concept) if p and p.strip()]
+    return " ".join(dict.fromkeys(parts)) or None
+
+
+@st.cache_data(show_spinner=False)
+def area_bundle_cached(_panel, code: str, cuisine: str | None,
+                       concept: str | None) -> dict:
+    """
+    One area's comparison bundle, assembled from the SAME cached analyses
+    the standalone views use — never a second analytical implementation.
+    Unmeasured stays None throughout; nothing is defaulted.
+    """
+    name = nta_names().get(code, code)
+    tiers = area_tiers_cached(_panel, code, cuisine, concept)
+
+    # With a cuisine this is concept fit; without one it is the SAME index
+    # computed over all concepts (restaurant persistence) — the identical
+    # number the standalone area view shows, so a no-cuisine comparison is
+    # never content-free. `fit_is_concept` records which one it is.
+    fit_index = fit_band = None
+    sat = {"band": None, "detail": None}
+    fit = (concept_fit_cached(_panel, cuisine) if cuisine
+           else conceptfree_fit_cached(_panel))
+    if code in fit.index:
+        fit_band = fit.loc[code, "band"]
+        if pd.notna(fit.loc[code, "fit_index"]):
+            fit_index = float(fit.loc[code, "fit_index"])
+    if cuisine:
+        dens = density_cached(_panel, cuisine)
+        sat = areas.competitor_saturation(
+            int(dens.loc[code, "active_same"]) if code in dens.index else 0,
+            float(dens.loc[code, "density_percentile"])
+            if code in dens.index else None)
+
+    turn = turnover_cached(_panel)
+    evidence = evidence_cached(_panel)
+    feats = area_features_cached(_panel)
+    ped = area_ped_context(code)
+    _, demo = acs_by_nta_cached()
+
+    persistence = cohort_n = None
+    if code in feats.index:
+        cohort_n = int(feats.loc[code, "cohort_n"])
+        if pd.notna(feats.loc[code, "persistence_rate"]):
+            persistence = float(feats.loc[code, "persistence_rate"])
+
+    income = population = None
+    if demo is not None and code in demo.index:
+        if pd.notna(demo.loc[code, "income_context"]):
+            income = float(demo.loc[code, "income_context"])
+        if pd.notna(demo.loc[code, "population"]):
+            population = float(demo.loc[code, "population"])
+
+    turn_band = turn.loc[code, "band"] if code in turn.index else None
+    return dict(
+        code=code, name=name, cuisine=cuisine,
+        fit_is_concept=bool(cuisine),
+        fit_index=fit_index, fit_band=fit_band,
+        evidence=(evidence.loc[code, "band"]
+                  if code in evidence.index else None),
+        competition_band=sat["band"], competition_detail=sat.get("detail"),
+        turnover=turn_band, ped_band=ped["band"],
+        ped_sites=ped.get("sites", 0),
+        restaurants_total=tiers["total"],
+        # Counts mirror the map legend exactly: the tiers are disjoint, so
+        # "Similar concept" is the similar tier alone. Closest is None —
+        # not 0 — when the records cannot identify the concept at all.
+        similar_count=len(tiers["similar"]) if cuisine else None,
+        closest_count=(None if tiers.get("unidentifiable")
+                       else len(tiers["closest"])),
+        persistence_rate=persistence, cohort_n=cohort_n or 0,
+        income_context=income, population=population)
+
+
+def build_comparison_payload(bundles: list[dict],
+                             plan) -> comparison.ComparisonReportPayload:
+    """The frozen report payload — validated data only, methodology from the
+    live constants, limitations always present."""
+    import datetime
+    leaders, recommendation = comparison.comparison_summary(bundles)
+    area_reports = []
+    for b in bundles:
+        area_reports.append(comparison.AreaReport(
+            **{k: b.get(k) for k in (
+                "code", "name", "fit_is_concept", "fit_index", "fit_band",
+                "evidence", "competition_band", "competition_detail",
+                "turnover", "ped_band", "ped_sites", "restaurants_total",
+                "similar_count", "closest_count", "persistence_rate",
+                "cohort_n", "income_context", "population")},
+            pros=comparison.derive_area_pros(b),
+            cons=comparison.derive_area_cons(b),
+            risks=comparison.derive_risk_matrix(b)))
+
+    # Taken from the bundles, not session state: the payload must describe
+    # the analyses it actually contains, whoever calls it.
+    cuisine = next((b.get("cuisine") for b in bundles if b.get("cuisine")),
+                   None)
+    concept_bits = [p for p in (cuisine, plan.concept if plan else None)
+                    if p]
+    methodology = [
+        ["Location fit", "A 0–100 relative decision index for comparing "
+                         "locations — never a probability of success. "
+                         "Weighted components (editorial weights): "
+                         + ", ".join(f"{narrative.COMPONENTS[k][0]} {w}%"
+                                     for k, w in scoring.WEIGHTS.items())],
+        ["Concept fit", f"Observed persistence of the concept's competitive "
+                        f"set (2011–17 cohort still listed in 2026) versus "
+                        f"the same set citywide; index "
+                        f"{areas.FIT_NEUTRAL} + gap × {areas.FIT_SLOPE}, "
+                        f"clipped 0–100, local sample of at least "
+                        f"{areas.MIN_CUISINE_SAMPLE} required."],
+        ["Evidence quality", f"High / Moderate / Limited from cohort depth "
+                             f"(≥{areas.MIN_AREA_SAMPLE}), active inventory "
+                             f"(≥{areas.MIN_AREA_SAMPLE}), and ACS "
+                             f"coverage."],
+        ["Competition", "Comparable-restaurant density from public records "
+                        "(percentile among NYC areas). Missing data never "
+                        "reads as low competition."],
+        ["Observed persistence & turnover", "The share of 2011–17 "
+                                            "restaurants still listed in "
+                                            "2026, and the share gone since "
+                                            "2017 — never survival or "
+                                            "failure rates."],
+        ["Opportunity gap", "A lookup combining relative concept fit with "
+                            "the competition reading — not unmet demand."],
+        ["Data sources", "NYC DOHMH restaurant records, Google Places, "
+                         "2024 ACS 5-Year, PLUTO, NYC DOT pedestrian "
+                         "counts, NYC Planning 2020 NTA geographies."],
+    ]
+    limitations = [
+        comparison.LIMITATION,
+        "Both DOHMH extracts window inspections to about three years, so "
+        "longitudinal reads are cohort cross-checks, never lifespans.",
+        "Pedestrian evidence comes from 114 DOT bi-annual count sites; "
+        "areas without a site read Not measured.",
+        "Google Places enrichment reflects indexed listings, not exhaustive "
+        "coverage.",
+    ]
+    return comparison.ComparisonReportPayload(
+        concept_line=" ".join(concept_bits).title() if concept_bits else
+        "General restaurant concept",
+        plan_items=plan_chip_values(plan) if plan else [],
+        generated=datetime.date.today().isoformat(),
+        areas=area_reports, leaders=leaders,
+        recommendation=recommendation, methodology=methodology,
+        limitations=limitations)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def narrative_cached(payload_json: str, key_present: bool,
+                     _api_key: str | None) -> dict | None:
+    """One narrative call per frozen payload — never re-invoked by reruns,
+    tab switches, or repeated exports of the same comparison."""
+    payload = comparison.ComparisonReportPayload.parse_raw(payload_json)
+    return report_writer.narrate(payload, _api_key)
+
+
+def _remove_compare_area(code: str) -> None:
+    ids = st.session_state.get("comparison_area_ids", [])
+    st.session_state["comparison_area_ids"] = [c for c in ids if c != code]
+    st.session_state.pop("report_pdf", None)
+
+
+def _clear_comparison() -> None:
+    st.session_state["comparison_area_ids"] = []
+    st.session_state.pop("report_pdf", None)
+    if st.session_state.get("workspace_view") == "compare":
+        st.session_state["workspace_view"] = "explore"
+
+
+def render_compare_tray() -> None:
+    """Persistent compact tray — visible whenever areas are queued."""
+    ids = st.session_state.get("comparison_area_ids", [])
+    if not ids:
+        return
+    names = nta_names()
+    with st.container(border=True, key="compare_tray"):
+        ui.eyebrow("Compare areas")
+        for i, code in enumerate(ids, 1):
+            row_l, row_r = st.columns([5, 1])
+            row_l.markdown(f"**{i}** &nbsp; {names.get(code, code)}")
+            row_r.button("×", key=f"cmp_rm_{code}",
+                         on_click=_remove_compare_area, args=(code,))
+        left, right = st.columns([1.4, 1])
+        left.caption(f"{len(ids)} / {comparison.MAX_COMPARE_AREAS} selected"
+                     + ("" if len(ids) >= 2 else " — add one more to "
+                                                 "compare"))
+        if len(ids) >= 2:
+            if right.button("Compare →", key="cmp_go", type="primary",
+                            width="stretch"):
+                st.session_state["workspace_view"] = "compare"
+                st.rerun()
+        else:
+            right.button("Compare →", key="cmp_go", disabled=True,
+                         width="stretch")
+        st.button("Clear", key="cmp_clear", on_click=_clear_comparison)
+
+
+def render_add_to_comparison(code: str) -> None:
+    """The intentional add action — polygon clicks never auto-add."""
+    ids = st.session_state.get("comparison_area_ids", [])
+    if code in ids:
+        st.button("✓ Added to comparison", key=f"cmp_added_{code}",
+                  disabled=True, width="stretch")
+    elif len(ids) >= comparison.MAX_COMPARE_AREAS:
+        st.button("Comparison full — maximum 3 areas",
+                  key=f"cmp_full_{code}", disabled=True, width="stretch")
+    else:
+        if st.button("+ Add to comparison", key=f"cmp_add_{code}",
+                     width="stretch"):
+            st.session_state["comparison_area_ids"] = ids + [code]
+            st.session_state.pop("report_pdf", None)
+            st.rerun()
+
+
+def render_compare_view(panel, cuisine: str | None, plan) -> None:
+    """AREA COMPARISON — 2–3 areas against the SAME plan, same dark shell."""
+    ids = st.session_state.get("comparison_area_ids", [])[
+        :comparison.MAX_COMPARE_AREAS]
+    names = nta_names()
+    bundles = [area_bundle_cached(panel, code, cuisine,
+                                  plan.concept if plan else None)
+               for code in ids]
+
+    top_l, top_r = st.columns([2.2, 1])
+    with top_l:
+        ui.eyebrow("Compare areas")
+        concept_bits = " ".join(p for p in (
+            cuisine, plan.concept if plan else None) if p)
+        st.markdown(f"### {' vs '.join(b['name'] for b in bundles)}")
+        if concept_bits:
+            st.caption(f"{concept_bits.title()} — every area compared "
+                       f"against the same plan.")
+    with top_r:
+        if st.button("← Back to map", key="cmp_back", width="stretch"):
+            st.session_state["workspace_view"] = "explore"
+            st.rerun()
+
+    # ----- summary matrix ---------------------------------------------------
+    fit_label = ("Relative concept fit" if cuisine
+                 else "Restaurant persistence (all concepts)")
+    matrix_rows = {
+        fit_label: [
+            f"{b['fit_index']:.0f} / 100" if b["fit_index"] is not None
+            else "Not measured" for b in bundles],
+        "Band": [b["fit_band"] or "Not measured" for b in bundles],
+        "Evidence": [b["evidence"] or "—" for b in bundles],
+        "Competition": [b["competition_band"] or "Not measured"
+                        for b in bundles],
+        "Observed turnover": [
+            _TURNOVER_READ.get(b["turnover"], b["turnover"] or "—")
+            for b in bundles],
+        "Pedestrian context": [b["ped_band"] or "Not measured"
+                               for b in bundles],
+        "Restaurants": [f"{b['restaurants_total']:,}" for b in bundles],
+    }
+    if cuisine:
+        matrix_rows["Similar concept"] = [
+            str(b["similar_count"]) for b in bundles]
+        matrix_rows["Closest match"] = [
+            str(b["closest_count"]) for b in bundles]
+    frame = pd.DataFrame(matrix_rows,
+                         index=[b["name"] for b in bundles]).T
+    st.dataframe(frame, width="stretch")
+
+    # ----- deterministic leaders -------------------------------------------
+    leaders, recommendation = comparison.comparison_summary(bundles)
+    ui.eyebrow("Where each area leads")
+    low_band = leaders.get("lowest_competition_band")
+    ui.bench_rows([
+        ("Leading on relative fit",
+         " / ".join(leaders["leading_fit"]) or "Insufficient evidence"),
+        ("Lowest competition",
+         (" / ".join(leaders["lowest_competition"])
+          + (f" (still {low_band.lower()})" if low_band == "High" else ""))
+         or "Insufficient evidence"),
+        ("Strongest evidence",
+         " / ".join(leaders["strongest_evidence"]) or
+         "Insufficient evidence"),
+    ])
+    st.caption(recommendation + " Relative comparisons only — never a "
+                                "success prediction.")
+
+    # ----- per-area detail --------------------------------------------------
+    cols = st.columns(len(bundles), gap="medium")
+    for col, b in zip(cols, bundles):
+        with col:
+            st.markdown(f"#### {b['name']}")
+            pros = comparison.derive_area_pros(b)
+            cons = comparison.derive_area_cons(b)
+            ui.eyebrow("Pros")
+            for p in pros or []:
+                st.markdown(f"<span style='color:var(--positive);'>+</span> "
+                            f"{p.label}", unsafe_allow_html=True)
+            if not pros:
+                st.caption("No standout strengths under current evidence.")
+            ui.eyebrow("Cons")
+            for c in cons or []:
+                st.markdown(f"<span style='color:var(--negative);'>–</span> "
+                            f"{c.label}", unsafe_allow_html=True)
+            if not cons:
+                st.caption("No material flags under current evidence.")
+            with st.expander("Risk analysis"):
+                ui.bench_rows([(r.category, r.level)
+                               for r in comparison.derive_risk_matrix(b)])
+                for r in comparison.derive_risk_matrix(b):
+                    st.caption(f"{r.category}: {r.why} (evidence: "
+                               f"{r.evidence})")
+
+    # ----- PDF export -------------------------------------------------------
+    st.divider()
+    export_l, export_r = st.columns([2.2, 1])
+    with export_r:
+        if st.button("Export report ↓", key="cmp_export", width="stretch"):
+            with st.spinner("Generating report…"):
+                payload = build_comparison_payload(bundles, plan)
+                key = get_anthropic_api_key()
+                narrative_dict = narrative_cached(payload.json(), bool(key),
+                                                  key)
+                pdf = report_pdf.render_pdf(payload, narrative_dict)
+                st.session_state["report_pdf"] = (
+                    report_pdf.report_filename(payload), pdf,
+                    narrative_dict is not None)
+        stored = st.session_state.get("report_pdf")
+        if stored:
+            filename, pdf_bytes, used_llm = stored
+            st.download_button("Download PDF report ↓", data=pdf_bytes,
+                               file_name=filename, mime="application/pdf",
+                               type="primary", width="stretch",
+                               key="cmp_download")
+            if not used_llm:
+                st.caption("Narrative written from deterministic templates "
+                           "(language model unavailable) — all analytics "
+                           "identical.")
+    with export_l:
+        st.caption(comparison.LIMITATION)
 
 
 # ---------------------------------------------------------------- confirm
@@ -1918,15 +3018,21 @@ def confirm_page(panel) -> None:
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            options = sorted(known)
+            # "Any cuisine" heads the list and is the default whenever the
+            # user named no cuisine: an unspecified cuisine stays None —
+            # NEVER the alphabetically-first taxonomy label (the "brunch
+            # spot -> Afghan" bug was exactly index=0 on a sorted list).
+            options = [CUISINE_ANY] + sorted(known)
             index = options.index(normalized) if normalized in options else 0
-            cuisine = st.selectbox(
+            cuisine_choice = st.selectbox(
                 "Cuisine", options, index=index,
-                help=None if normalized else
+                help=None if (normalized or not plan.cuisine) else
                 "We couldn't match your wording to a known cuisine — "
-                "pick one.")
+                "pick one, or leave it as Any cuisine.")
+            cuisine = None if cuisine_choice == CUISINE_ANY else cuisine_choice
             concept = st.text_input("Concept", value=plan.concept or "",
-                                    placeholder="e.g. upscale, casual")
+                                    placeholder="e.g. brunch spot, upscale, "
+                                                "casual")
         with c2:
             address = st.text_input(
                 "Address", value=plan.address or "",
@@ -1944,6 +3050,40 @@ def confirm_page(panel) -> None:
                 value=int(plan.seats) if plan.seats else None, step=5,
                 placeholder="—")
 
+        # --- deterministic area resolution, alternatives surfaced HERE ----
+        # (never a third onboarding screen). The Area field is authoritative:
+        # a ZIP routes by restaurant records, a borough routes discovery,
+        # and a neighborhood name resolves against the app's own 2020
+        # geography — with a choice shown when one name maps to several.
+        area_text = area.strip()
+        area_zip = re.fullmatch(r"\d{5}", area_text)
+        # Borough compare is normalized ("Brooklyn." / "the bronx" both
+        # count) so a punctuated borough can never leak into name matching.
+        area_folded = re.sub(r"^the\s+", "",
+                             re.sub(r"[^a-z ]", "", area_text.lower())).strip()
+        area_borough = next(
+            (b for b in plan_parser.NYC_BOROUGHS
+             if b.lower() == area_folded), None)
+        chosen_code = None
+        if area_text and not area_zip and not area_borough:
+            candidates = resolve_area_candidates(area_text, plan.borough)
+            if len(candidates) > 1:
+                names = nta_names()
+                boroughs = {c: f["borough"]
+                            for c, f in nta_index().features.items()}
+                labels = {f"{names[c]} ({boroughs.get(c, '?')})": c
+                          for c in candidates}
+                pick = st.selectbox(
+                    f"“{area_text}” matches more than one NYC area — which "
+                    f"one?", list(labels), index=0, key="area_disambig")
+                chosen_code = labels[pick]
+            elif candidates:
+                chosen_code = candidates[0]
+            else:
+                st.caption(f"“{area_text}” doesn't match a neighborhood in "
+                           f"the current NYC geography — Analyze will rank "
+                           f"the best-fitting areas instead.")
+
         prefs = [f"{label}: {value}" for label, value in [
             ("Foot traffic", plan.foot_traffic_preference),
             ("Competition tolerance", plan.competition_tolerance),
@@ -1960,7 +3100,7 @@ def confirm_page(panel) -> None:
         left, right = st.columns([1, 2])
         rewrite = left.button("← Rewrite", width="stretch")
         analyze = right.button("Analyze →", type="primary", width="stretch")
-        if not (address.strip() or area.strip()):
+        if not (address.strip() or area_text):
             st.caption("No location yet — Analyze will rank the areas where "
                        "this concept shows the best relative fit.")
 
@@ -1980,45 +3120,209 @@ def confirm_page(panel) -> None:
             address=address.strip() or None,
             average_spend=spend or None,
             seats=int(seats) if seats else None))
-        st.session_state["confirmed_plan"] = edited
         st.session_state["plan_confirmed"] = True
-        st.session_state["cuisine"] = cuisine
-        st.session_state["price"] = plan.price_positioning or "$$"
+        st.session_state["cuisine"] = cuisine        # None = no cuisine given
+        # A new plan must beat any stale workspace concept selection.
+        st.session_state["ws_concept"] = cuisine or CUISINE_ANY
+        st.session_state["price"] = plan.price_positioning
+        # A cleared Area field is a decision: the parse prefilled it, so
+        # emptying it means "no area" — stale parsed location fields must
+        # not resurface in routing, chips, or the plan-usage panel.
+        prefill = plan.zipcode or plan.neighborhood or plan.borough or ""
+        cleared = bool(prefill.strip()) and not area_text
         # An "address" with no building number is an area phrase, whatever
         # parser produced it — geocoding it invites the silent-mis-placement
         # class of failure (GeoSearch picks an arbitrary building).
+        demoted_name = None
         if (edited.location_kind() == "address"
                 and not geocode.has_house_number(edited.address or "")):
-            edited = edited.copy(update=dict(
-                address=None,
-                neighborhood=edited.neighborhood or edited.address))
-        if edited.location_kind() == "address":
+            demoted_name = edited.address
+            edited = edited.copy(update=dict(address=None))
+        # Priority: address -> ZIP -> recognized neighborhood -> borough ->
+        # discovery. A recognized neighborhood ALWAYS overrides discovery,
+        # and the Area FIELD is the location authority throughout.
+        if edited.location_kind() == "address" and edited.address:
             target = edited.address
-            if area.strip() and not any(
+            if area_text and not any(
                     tok.lower() in target.lower()
-                    for tok in area.replace(",", " ").split()):
-                target = f"{target}, {area.strip()}"
+                    for tok in area_text.replace(",", " ").split()):
+                target = f"{target}, {area_text}"
             st.session_state["address"] = target
             st.session_state["workspace_mode"] = "site"
+            edited = edited.copy(update=dict(address=target, zipcode=None,
+                                             neighborhood=None))
         else:
             # AREA / DISCOVERY — no street address required, ever.
             st.session_state["address"] = None
             panel_df = load_panel()
-            area_text = (edited.zipcode or edited.neighborhood or area.strip()
-                         or "")
             code = None
-            if edited.zipcode:
-                code = zip_to_nta(panel_df, edited.zipcode)
-            elif area_text:
-                code = neighborhood_to_nta(area_text)
+            if area_zip:
+                code = zip_to_nta(panel_df, area_text)
+            elif chosen_code:
+                code = chosen_code
+            elif demoted_name and not cleared:
+                # The numberless "address" the field never saw — resolve it
+                # here (never a stale parsed neighborhood: only the phrase
+                # demoted in THIS submit).
+                demoted = resolve_area_candidates(demoted_name,
+                                                  edited.borough)
+                code = demoted[0] if demoted else None
             if code:
                 st.session_state["workspace_mode"] = "area"
+                st.session_state["requested_area"] = code
                 select_area(code)
+                edited = edited.copy(update=dict(
+                    zipcode=area_text if area_zip else None,
+                    neighborhood=(None if area_zip
+                                  else nta_names().get(code))))
             else:
                 st.session_state["workspace_mode"] = "discovery"
-                st.session_state["discovery_borough"] = edited.borough
+                st.session_state["discovery_borough"] = (
+                    area_borough or (None if cleared else edited.borough))
+                edited = edited.copy(update=dict(
+                    zipcode=None, neighborhood=None,
+                    borough=st.session_state["discovery_borough"]))
+        # Stored AFTER routing so chips and "how your plan was used" always
+        # describe the fields the analysis actually used.
+        st.session_state["confirmed_plan"] = edited
+        st.session_state["workspace_view"] = "assess"
         st.session_state["stage"] = "results"
         st.rerun()
+
+
+
+
+def render_method_page(status: list[tuple[str, bool]] | None = None) -> None:
+    """
+    METHOD — a full in-app page in the top navigation, never behind the
+    sidebar. Every number renders from the live constants in scoring.py /
+    areas.py / narrative.py, so this page cannot drift from the code.
+    """
+    ui.eyebrow("Method")
+    st.markdown("### How the analysis works")
+
+    left, right = st.columns(2, gap="large")
+    with left:
+        ui.eyebrow("Location fit")
+        st.caption("A 0–100 relative decision index for comparing locations "
+                   "— never a probability of success. Weighted components "
+                   "(weights are editorial, from scoring.py):")
+        ui.bench_rows([
+            (narrative.COMPONENTS[k][0], f"{w}%")
+            for k, w in scoring.WEIGHTS.items()])
+        lower, upper = scoring.BANDS[0][1], scoring.BANDS[1][1]
+        st.caption(f"Component reads: favourable below {lower} risk, concern "
+                   f"above {upper} (the same cut points as the bands). Fit "
+                   f"bands: " + " · ".join(
+                       f"{name} ≥ {floor}"
+                       for floor, name in narrative.FIT_BANDS
+                       if name != "High risk") + ".")
+
+        ui.eyebrow("Concept fit")
+        cap_gap = (100 - areas.FIT_NEUTRAL) / areas.FIT_SLOPE
+        st.caption(
+            f"Observed persistence of the concept's competitive set "
+            f"(2011–17 cohort still listed in 2026) versus the same set "
+            f"citywide, only where the local sample reaches "
+            f"{areas.MIN_CUISINE_SAMPLE} restaurants; smaller samples read "
+            f"Limited evidence. The index is {areas.FIT_NEUTRAL} + "
+            f"(local − citywide rate) × {areas.FIT_SLOPE}, clipped to "
+            f"0–100, and tracks the raw gap. Ranked concepts need at least "
+            f"{areas.MIN_CITYWIDE_CUISINE} active NYC restaurants. STRONG "
+            f"is reserved for local rates that clear sampling uncertainty "
+            f"(Wilson interval) above the citywide baseline; above-baseline "
+            f"differences inside that margin read PROMISING — directional, "
+            f"not statistically established.")
+        st.caption(
+            f"Because the index is capped, any concept whose local "
+            f"still-listed rate beats the citywide baseline by "
+            f"{cap_gap * 100:.0f}+ percentage points reaches 100 — multiple "
+            f"concepts can receive 100 when they reach the top score under "
+            f"the available evidence; 100 does not imply one concept is "
+            f"definitively better than all others, and never a 100% "
+            f"success probability.")
+
+        ui.eyebrow("Opportunity gap")
+        st.caption("A lookup that combines relative concept fit with the "
+                   "comparable-competition reading — NOT unmet demand, "
+                   "market demand, or a guaranteed opportunity. Anything "
+                   "unmeasured reads Insufficient evidence. The full matrix, "
+                   "rendered from the live function:")
+        ui.bench_rows([
+            (f"{fit} fit · {sat} competition",
+             areas.opportunity_gap(fit, sat)["band"])
+            for fit in ("Strong", "Promising", "Mixed")
+            for sat in ("Low", "Moderate", "High")])
+
+    with right:
+        ui.eyebrow("History")
+        st.caption("Both DOHMH extracts window each restaurant to about "
+                   "three years, so observed durations are not comparable "
+                   "between closed and surviving restaurants. Every "
+                   "longitudinal read is therefore OBSERVED PERSISTENCE — "
+                   "the share of 2011–17 restaurants still listed in 2026 — "
+                   "and OBSERVED TURNOVER, the share gone since 2017. "
+                   "Neither is a survival nor a failure rate.")
+
+        ui.eyebrow("Competition")
+        st.caption("Comparable-restaurant density from public records "
+                   "(percentile among NYC areas), sharpened at a site by "
+                   "live Google competitor strength when available. Missing "
+                   "competition data is never read as low competition.")
+
+        ui.eyebrow("Restaurant similarity")
+        st.caption("Map markers are graded by how specifically current data "
+                   "can match your concept. CLOSEST MATCH is the highest "
+                   "specificity the records support: the exact cuisine "
+                   "label, narrowed to establishments whose public-record "
+                   "NAME announces the concept (a “brunch”, “coffee” or "
+                   "“bakery” in the name). SIMILAR is the cuisine's "
+                   "competitive set. ALL is every current establishment in "
+                   "the area. Public records do not classify concepts, so "
+                   "when a concept cannot be identified the app says so "
+                   "rather than relabelling every same-cuisine restaurant "
+                   "as a match.")
+
+        ui.eyebrow("Area comparison")
+        st.caption(f"Up to {comparison.MAX_COMPARE_AREAS} areas, each "
+                   f"analysed with the SAME functions the standalone area "
+                   f"view uses — never a second implementation. Pros, cons "
+                   f"and the risk matrix are derived from those signals by "
+                   f"lookup; risk is categorical "
+                   f"({' / '.join(comparison.RISK_LEVELS)}) and never a "
+                   f"probability. Absent evidence is reported as "
+                   f"insufficient, never as a negative finding.")
+
+        ui.eyebrow("Evidence quality")
+        st.caption(f"Two systems, both from stated checks. AREA pages and "
+                   f"the map layer: High / Moderate / Limited from cohort "
+                   f"depth (≥{areas.MIN_AREA_SAMPLE}), active inventory "
+                   f"(≥{areas.MIN_AREA_SAMPLE}), and ACS coverage. SITE "
+                   f"analysis: Strong / Moderate / Limited from evidence-"
+                   f"weight coverage (≥80% measurable), the nearby "
+                   f"historical cohort (≥100 restaurants), and live "
+                   f"competitor data being available — its reasons are "
+                   f"listed with the score. Evidence describes the data, "
+                   f"never the location — an unmeasured component is "
+                   f"dropped and named, never scored as average or "
+                   f"negative.")
+
+        ui.eyebrow("Data sources")
+        ui.bench_rows([("Restaurant records", "NYC DOHMH"),
+                       ("Live competitors", "Google Places"),
+                       ("Demographics", "2024 ACS 5-Year"),
+                       ("Property", "PLUTO"), ("Pedestrians", "NYC DOT"),
+                       ("Geography", "NYC Planning 2020 NTAs")])
+        if status:
+            st.caption("Connected now: " + " · ".join(
+                f"{'●' if ok else '○'} {name}" for name, ok in status))
+
+        ui.eyebrow("Claude's role")
+        st.caption("Claude converts your restaurant description into "
+                   "structured search parameters — language parsing only. "
+                   "It does not score locations, rank areas, or supply any "
+                   "market fact; every analytical number on every page "
+                   "comes from the datasets above.")
 
 
 
@@ -2027,25 +3331,40 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
                       verdicts, fit, band, headline, quality, area_ctx,
                       lot, ped) -> None:
     """ONE verdict, above the fold, then tabs. No duplicated band anywhere."""
-    ui.eyebrow(f"{cuisine} · Site analysis")
+    if st.button("← Back to explore", key="back_explore"):
+        # Non-destructive: select the site's area for spatial context and
+        # switch the VIEW — the site analysis stays one Assess click away.
+        code = nta_index().locate(site["lat"], site["lon"])
+        if code:
+            select_area(code)
+        st.session_state["workspace_view"] = "explore"
+        st.rerun()
+    ui.eyebrow(f"{cuisine or 'Restaurant'} · Site analysis")
     st.markdown(f"#### {site['label']}")
     a, b = st.columns([1.2, 1])
     with a:
         st.markdown(
             f'<span style="font-size:34px;font-weight:600;">'
             f'{fit if fit is not None else "–"}</span>'
-            f'<span style="font-size:15px;color:var(--text-secondary);"> '
-            f'{band}</span>', unsafe_allow_html=True)
+            f'<span style="font-size:16px;color:var(--text-muted);"> / 100'
+            f'</span>  <span style="font-size:15px;color:var(--text-secondary);'
+            f'font-weight:600;">{band}</span>', unsafe_allow_html=True)
         st.markdown(f"<span style='font-size:12.5px;color:var(--text-muted);'>"
                     f"Location fit · relative index · Evidence quality: "
                     f"{quality[0] if quality else '—'}</span>",
                     unsafe_allow_html=True)
+        with st.expander("What does this mean?"):
+            st.caption(
+                "A relative location-fit index combining the evidence "
+                "available for this site, for comparing locations. It is "
+                "not a probability of restaurant success.")
     with b:
-        if st.button("Simulate →", type="primary", width="stretch"):
-            st.session_state["sim_location_id"] = (site["label"], cuisine)
-            st.session_state.pop("sim_results", None)
-            st.session_state["stage"] = "simulate"
-            st.rerun()
+        if simulation_enabled():
+            if st.button("Simulate →", type="primary", width="stretch"):
+                st.session_state["sim_location_id"] = (site["label"], cuisine)
+                st.session_state.pop("sim_results", None)
+                st.session_state["stage"] = "simulate"
+                st.rerun()
     st.markdown(headline)
     if site.get("warning"):
         st.warning(f"**Check the address.** {site['warning']}")
@@ -2070,18 +3389,26 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
                      conclusion=gap["reason"].capitalize(),
                      evidence_stat=""),
             ])
+            plan = st.session_state.get("confirmed_plan")
+            sat_pct = area_ctx["saturation"].get("density_percentile")
+            alignment = preference_alignment(
+                plan, area_ctx["saturation"]["band"],
+                income_percentile_cached(area_ctx["nta_code"]),
+                float(sat_pct) if sat_pct is not None else None,
+                area_ped_context(area_ctx["nta_code"])["band"])
+            render_priorities(plan, alignment, cuisine,
+                              area_ctx["nta_name"])
             ranking = concept_ranking_cached(panel, area_ctx["nta_code"])
             if ranking:
-                ui.eyebrow("Best-fitting concepts here")
-                ui.bench_rows([
-                    (f"{i}. {r['cuisine']}",
-                     f"{r['fit_index']:.0f} · {r['band']}")
-                    for i, r in enumerate(ranking[:3], 1)])
+                render_concept_rows(panel, area_ctx["nta_code"], ranking,
+                                    own_concept=bool(cuisine))
                 with st.expander("More concepts & comparison"):
                     ui.bench_rows([
                         (f"{i}. {r['cuisine']}",
                          f"{r['fit_index']:.0f} · {r['band']} · "
-                         f"n={r['cohort_n']}")
+                         f"n={r['cohort_n']}"
+                         + (" · label artifact" if _label_artifact(r)
+                            else ""))
                         for i, r in enumerate(ranking[3:8], 4)])
                     picks = st.multiselect(
                         "Compare (max 3)", [r["cuisine"] for r in ranking],
@@ -2090,6 +3417,7 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
                         st.dataframe(areas.compare_concepts(
                             panel, nta_assignment(panel),
                             area_ctx["nta_code"], picks), width="stretch")
+            render_plan_usage(plan)
         # Strengths / risks — the ONLY other place conclusions appear.
         render_recommendation(
             narrative.assessment_label(fit, landscape), headline,
@@ -2097,7 +3425,7 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
             narrative.reason_for_caution(verdicts, landscape), cuisine)
         render_next(site, cuisine, fit, verdicts, landscape)
     with tab_comp:
-        render_google(landscape, cuisine, price)
+        render_google(landscape, cuisine or "restaurant", price, report)
     with tab_market:
         acs_table = load_acs()
         tract_metrics, tract_source = None, "unavailable"
@@ -2109,80 +3437,178 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
         render_market(ped, verdicts, tract_metrics, tract_source)
     with tab_history:
         render_history(report)
-        with st.expander(f"Cuisine performance — {cuisine} track record"):
-            render_cuisine(report)
+        if cuisine:
+            with st.expander(f"Cuisine track record — {cuisine}"):
+                render_cuisine(report)
+        else:
+            st.caption("No cuisine was specified, so there is no "
+                       "cuisine-specific track record to compare — the "
+                       "location history above covers all concepts.")
     with tab_property:
         render_context(lot, ped)
     render_limitations()
 
 
-def render_area_explorer(panel, code: str, cuisine: str) -> None:
-    """AREA EXPLORER: the polygon's intelligence, compact, no site score."""
-    name = nta_names().get(code, code)
-    ui.eyebrow(f"{cuisine} · Area analysis")
-    st.markdown(f"#### {name}")
+_TURNOVER_READ = {
+    "Lower observed turnover": "Lower than comparison areas",
+    "Typical": "Typical of comparison areas",
+    "Higher observed turnover": "Higher than comparison areas",
+    "Limited evidence": "Limited evidence",
+}
 
-    fit = concept_fit_cached(panel, cuisine)
-    frow = fit.loc[code] if code in fit.index else None
-    similar, other = area_restaurants(panel, code, cuisine)
-    dens = density_cached(panel, cuisine)
-    sat = areas.competitor_saturation(
-        int(dens.loc[code, "active_same"]) if code in dens.index else 0,
-        float(dens.loc[code, "density_percentile"])
-        if code in dens.index else None)
-    gap = areas.opportunity_gap(
-        frow["band"] if frow is not None else None, sat["band"])
-    turn = turnover_cached(panel)
-    evidence = evidence_cached(panel)
 
-    a, b = st.columns([1.2, 1])
-    with a:
-        fit_text = ("–" if frow is None or pd.isna(frow["fit_index"])
-                    else f"{frow['fit_index']:.0f}")
-        band_text = frow["band"] if frow is not None else "Limited evidence"
-        st.markdown(
-            f'<span style="font-size:34px;font-weight:600;">{fit_text}</span>'
-            f'<span style="font-size:15px;color:var(--text-secondary);"> '
-            f'{band_text}</span>', unsafe_allow_html=True)
-        st.caption(f"{cuisine} concept fit · Evidence: "
-                   f"{evidence.loc[code, 'band'] if code in evidence.index else '—'}")
-    with b:
-        st.caption("Have a specific address here?")
+def render_analyze_site_cta(code: str) -> None:
+    """The primary next action of an area analysis — unmistakable, near the
+    top: area analysis is complete, exact-site analysis is optional."""
+    st.caption("Have a specific address in this area?")
+    with st.form(f"site_cta_{code}", border=False):
         addr = st.text_input("Address", key=f"area_addr_{code}",
                              label_visibility="collapsed",
-                             placeholder="Analyze a site →")
-        if addr.strip():
-            st.session_state.update(
-                address=f"{addr.strip()}", workspace_mode="site")
-            st.session_state.pop("selected_area", None)
+                             placeholder="e.g. 460 Third Avenue")
+        go = st.form_submit_button("Analyze a specific site →",
+                                   type="primary", width="stretch")
+    if go and addr.strip():
+        borough = nta_index().features.get(code, {}).get("borough", "")
+        target = addr.strip()
+        if borough and borough.lower() not in target.lower():
+            target = f"{target}, {borough}"
+        st.session_state.update(address=target, workspace_mode="site",
+                                workspace_view="assess")
+        st.session_state.pop("selected_area", None)
+        st.session_state.pop("selected_restaurant", None)
+        st.rerun()
+    elif go:
+        st.caption(":orange[Type the street address first.]")
+
+
+def render_area_explorer(panel, code: str, cuisine: str,
+                         compact: bool = False) -> None:
+    """
+    AREA ANALYSIS: the answer to "how suitable is THIS area for the concept
+    I described?" — prominent header, the concept-fit read, the plan's
+    priorities, then the evidence. Never a redirect to other neighborhoods.
+    """
+    name = nta_names().get(code, code)
+    plan = st.session_state.get("confirmed_plan")
+    concept = plan.concept if plan else None
+
+    st.markdown(f"### {name}")
+    header_bits = " · ".join(p for p in (
+        cuisine, concept.title() if concept else None) if p)
+    ui.eyebrow(f"{header_bits or 'Restaurant'} · Area analysis")
+
+    # With no cuisine, the headline read is CONCEPT-INDEPENDENT restaurant
+    # persistence — labeled as exactly that, never dressed up as concept fit.
+    fit = (concept_fit_cached(panel, cuisine) if cuisine
+           else conceptfree_fit_cached(panel))
+    frow = fit.loc[code] if code in fit.index else None
+    tiers = area_tiers_cached(panel, code, cuisine, concept)
+    similar_n = len(tiers["closest"]) + len(tiers["similar"])
+    if cuisine:
+        dens = density_cached(panel, cuisine)
+        sat = areas.competitor_saturation(
+            int(dens.loc[code, "active_same"]) if code in dens.index else 0,
+            float(dens.loc[code, "density_percentile"])
+            if code in dens.index else None)
+        gap = areas.opportunity_gap(
+            frow["band"] if frow is not None else None, sat["band"])
+    else:
+        dens = None
+        sat = {"band": None, "detail": "No cuisine specified — comparable "
+                                       "competition unmeasured."}
+        gap = {"band": "Insufficient evidence",
+               "reason": "concept fit unmeasured without a cuisine"}
+    turn = turnover_cached(panel)
+    evidence = evidence_cached(panel)
+    ev_band = (evidence.loc[code, "band"] if code in evidence.index else "—")
+
+    fit_text = ("–" if frow is None or pd.isna(frow["fit_index"])
+                else f"{frow['fit_index']:.0f}")
+    band_text = frow["band"] if frow is not None else "Limited evidence"
+    st.markdown(
+        f'<span style="font-size:34px;font-weight:600;">{fit_text}</span>'
+        f'<span style="font-size:16px;color:var(--text-muted);"> / 100'
+        f'</span>  <span style="font-size:15px;'
+        f'color:var(--text-secondary);font-weight:600;">{band_text}'
+        f'</span>', unsafe_allow_html=True)
+    st.caption((f"Relative concept fit · {cuisine} · Evidence: {ev_band}"
+                if cuisine else
+                f"Restaurant persistence (all concepts) · relative index · "
+                f"Evidence: {ev_band}"))
+
+    render_analyze_site_cta(code)
+    render_add_to_comparison(code)
+
+    if compact:
+        ui.stat_strip([
+            (f"{tiers['total']:,}", "Restaurants"),
+            (f"{similar_n:,}" if cuisine else f"{len(tiers['closest']):,}",
+             "Similar concept" if cuisine else "Closest match"),
+            (sat["band"] or "—", "Competitor density"),
+        ])
+        if st.button("Open full analysis →", width="stretch",
+                     key="open_assess"):
+            st.session_state["workspace_view"] = "assess"
             st.rerun()
+        return
+
+    ui.eyebrow("How this area looks for your plan")
+    turn_band = (turn.loc[code, "band"] if code in turn.index
+                 else "Limited evidence")
+    ui.bench_rows([
+        ("Concept fit" if cuisine else "Restaurant persistence", band_text),
+        ("Competition", sat["band"] or "Not measured"),
+        ("Opportunity gap", gap["band"]),
+        ("Observed turnover", _TURNOVER_READ.get(turn_band, turn_band)),
+        ("Evidence", ev_band),
+    ])
+    if gap["band"] != "Insufficient evidence":
+        st.caption(gap["reason"].capitalize() + ".")
+    elif not cuisine and concept:
+        st.caption(f"“{concept.title()}” has no cuisine — the reads above "
+                   f"are concept-independent restaurant evidence, clearly "
+                   f"labeled; nothing is invented for the concept.")
+
+    alignment = preference_alignment(
+        plan, sat["band"], income_percentile_cached(code),
+        float(dens.loc[code, "density_percentile"])
+        if dens is not None and code in dens.index else None,
+        area_ped_context(code)["band"])
+    render_priorities(plan, alignment, cuisine or "Restaurant", name)
 
     ui.stat_strip([
-        (f"{len(similar) + len(other):,}", "Restaurants"),
-        (f"{len(similar):,}", "Similar concept"),
+        (f"{tiers['total']:,}", "Restaurants"),
+        (f"{similar_n:,}" if cuisine else f"{len(tiers['closest']):,}",
+         "Similar concept" if cuisine else "Closest match"),
         (sat["band"] or "—", "Competitor density"),
     ])
-    ui.evidence_rows([
-        dict(label="Opportunity gap", verdict=gap["band"],
-             tone={"High": "good", "Moderate": "neutral",
-                   "Low": "concern"}.get(gap["band"], "unknown"),
-             conclusion=gap["reason"].capitalize(), evidence_stat=""),
-        dict(label="Observed turnover",
-             verdict=turn.loc[code, "band"] if code in turn.index else "—",
-             tone="neutral", conclusion="", evidence_stat=""),
-    ])
-    top = (similar["cuisine"].value_counts().head(1).index.tolist()
-           + other["cuisine"].replace("", pd.NA).dropna()
+    if tiers["note"]:
+        st.caption(tiers["note"])
+    grouped = pd.concat([tiers["closest"], tiers["similar"]])
+    top = (grouped["cuisine"].value_counts().head(1).index.tolist()
+           + tiers["other"]["cuisine"].replace("", pd.NA).dropna()
              .value_counts().head(3).index.tolist())
     if top:
         st.caption("Top cuisines: " + " · ".join(dict.fromkeys(top)))
 
     ranking = concept_ranking_cached(panel, code)
-    if ranking:
-        ui.eyebrow("Best-fitting concepts")
-        ui.bench_rows([(f"{i}. {r['cuisine']}",
-                        f"{r['fit_index']:.0f} · {r['band']}")
-                       for i, r in enumerate(ranking[:3], 1)])
+    render_concept_rows(panel, code, ranking, own_concept=bool(cuisine))
+    if ranking and len(ranking) > 3:
+        with st.expander("More concepts & comparison"):
+            ui.bench_rows([
+                (f"{i}. {r['cuisine']}",
+                 f"{r['fit_index']:.0f} · {r['band']} · n={r['cohort_n']}"
+                 + (" · label artifact" if _label_artifact(r) else ""))
+                for i, r in enumerate(ranking[3:8], 4)])
+            picks = st.multiselect(
+                "Compare (max 3)", [r["cuisine"] for r in ranking],
+                default=[], max_selections=3, key="ws_concepts")
+            if picks:
+                st.dataframe(areas.compare_concepts(
+                    panel, nta_assignment(panel), code, picks),
+                    width="stretch")
+
+    render_plan_usage(plan)
     if st.button("Clear area selection", width="stretch"):
         st.session_state.pop("selected_area", None)
         st.rerun()
@@ -2228,6 +3654,86 @@ def render_restaurant_card(panel, camis: str, landscape, site) -> None:
         st.rerun()
 
 
+# ---------------------------------------------------------------- nav
+def _set_view(view: str) -> None:
+    st.session_state["workspace_view"] = view
+
+
+def _reset_search() -> None:
+    """New Search: nothing from the previous plan may leak into the next —
+    especially not a cuisine the user never typed."""
+    for k in ("selected_area", "selected_restaurant", "workspace_mode",
+              "discovery_borough", "requested_area", "workspace_view",
+              "cuisine", "ws_concept", "ws_comp", "_comp_mirror",
+              "comparison_area_ids", "report_pdf", "confirmed_plan",
+              "plan_confirmed", "price", "plan_text", "plan_outcome",
+              "address"):
+        st.session_state.pop(k, None)
+    st.session_state["stage"] = "landing"
+
+
+def _to_workspace() -> None:
+    if st.session_state.get("plan_confirmed"):
+        st.session_state["stage"] = "results"
+
+
+def render_top_header(stage: str) -> None:
+    """
+    The top product bar: wordmark · NEW SEARCH | WORKSPACE · caption.
+    Exactly one navigation level lives here — the workspace tools (Explore
+    / Assess / Compare / Method) are the secondary row, never duplicated.
+    """
+    in_workspace = stage == "results"
+    c_mark, spacer, c_new, c_ws, c_right = st.columns(
+        [0.9, 1.8, 0.85, 0.85, 1.3])
+    c_mark.markdown('<div class="jx-wordmark" style="padding-top:6px;">'
+                    'Siting</div>', unsafe_allow_html=True)
+    c_new.button("New Search", key="nav_new", width="stretch",
+                 type="secondary" if in_workspace else "primary",
+                 on_click=_reset_search)
+    c_ws.button("Workspace", key="nav_workspace", width="stretch",
+                type="primary" if in_workspace else "secondary",
+                disabled=not st.session_state.get("plan_confirmed"),
+                on_click=_to_workspace)
+    c_right.markdown('<div class="jx-header-right" style="padding-top:12px;'
+                     'text-align:right;">NYC restaurant intelligence</div>',
+                     unsafe_allow_html=True)
+    st.markdown('<hr style="margin:4px 0 14px 0 !important;">',
+                unsafe_allow_html=True)
+
+
+def render_workspace_nav(view: str) -> None:
+    """
+    EXPLORE · ASSESS · (COMPARE) · METHOD — the workspace tool row.
+
+    on_click callbacks, deliberately: they run BEFORE the script body, so a
+    view switch costs exactly ONE rerun with the new view already active —
+    and the run is never interrupted mid-script, which would drop the keyed
+    toolbar widget state (layer, filter) Streamlit garbage-collects for
+    widgets that missed a run. Selection state is untouched: nothing
+    re-parses, re-geocodes, or recomputes.
+    """
+    has_compare = len(st.session_state.get("comparison_area_ids", [])) >= 2
+    widths = ([0.62, 0.62, 0.62, 0.62, 2.9] if has_compare
+              else [0.62, 0.62, 0.62, 3.5])
+    cols = st.columns(widths)
+    cols[0].button("Explore", key="nav_explore", width="stretch",
+                   type="primary" if view == "explore" else "secondary",
+                   on_click=_set_view, args=("explore",))
+    cols[1].button("Assess", key="nav_assess", width="stretch",
+                   type="primary" if view == "assess" else "secondary",
+                   on_click=_set_view, args=("assess",))
+    next_i = 2
+    if has_compare:
+        cols[2].button("Compare", key="nav_compare", width="stretch",
+                       type="primary" if view == "compare" else "secondary",
+                       on_click=_set_view, args=("compare",))
+        next_i = 3
+    cols[next_i].button("Method", key="nav_method", width="stretch",
+                        type="primary" if view == "method" else "secondary",
+                        on_click=_set_view, args=("method",))
+
+
 # ---------------------------------------------------------------- main
 def main() -> None:
     if not config.RESTAURANTS_PQ.exists():
@@ -2242,11 +3748,15 @@ def main() -> None:
     ui.inject_styles()
     st.session_state.setdefault("stage", "landing")
     stage = st.session_state["stage"]
-    assessed = bool(st.session_state.get("address")) and stage in ("results", "simulate")
-    ui.page_header({"landing": "explore", "confirm": "explore",
-                    "results": "assess",
-                    "simulate": "simulate"}[stage], simulate_enabled=assessed)
+    # ONE top-level navigation: New Search | Workspace. The old duplicated
+    # Explore/Assess stage spans are gone — the workspace tools live in the
+    # secondary row only.
+    render_top_header(stage)
     if stage == "simulate":
+        if not simulation_enabled():
+            st.session_state["stage"] = "results"
+            st.rerun()
+            return
         simulate_page(panel, locs)
         return
     if stage == "confirm":
@@ -2260,15 +3770,65 @@ def main() -> None:
         st.session_state["stage"] = "landing"
         st.rerun()
         return
+    # Concept sync BEFORE analysis: the workspace selectbox is keyed, so its
+    # new value is already in session state here — one rerun per concept
+    # change, not the mutate-then-rerun double of earlier versions.
+    ws_concept = st.session_state.get("ws_concept")
+    if ws_concept:
+        ws_value = None if ws_concept == CUISINE_ANY else ws_concept
+        if ws_value != st.session_state["cuisine"]:
+            st.session_state["cuisine"] = ws_value
+            # report_pdf was rendered for the PREVIOUS concept; leaving it
+            # downloadable would hand the user a report that contradicts
+            # the screen.
+            for k in ("sim_results", "sim_location_id",
+                      "selected_restaurant", "report_pdf"):
+                st.session_state.pop(k, None)
     cuisine = st.session_state["cuisine"]
-    price = st.session_state.get("price", "$$")
+    price = st.session_state.get("price")
     mode = st.session_state.get("workspace_mode", "site")
     address = st.session_state.get("address")
+    view = st.session_state.setdefault("workspace_view", "assess")
+    plan = st.session_state.get("confirmed_plan")
+
+    # ---------------- top workspace navigation (no sidebar, ever) ----------
+    render_workspace_nav(view)
+    chips = plan_chip_values(
+        plan,
+        area_name=nta_names().get(st.session_state.get("selected_area")),
+        site_label=address if mode == "site" else None)
+    ui.plan_chips(chips)
+
+    if view == "method":
+        render_method_page([
+            ("DOHMH", True),
+            ("Google Places", bool(google_api_key())),
+            ("ACS", load_acs() is not None),
+            ("PLUTO", True), ("DOT", True)])
+        if "dev_trace_ws" not in st.session_state:
+            st.session_state["dev_trace_ws"] = st.session_state.get(
+                "_dev_trace", False)
+        st.checkbox("Developer trace", key="dev_trace_ws")
+        st.session_state["_dev_trace"] = st.session_state["dev_trace_ws"]
+        return
+
+    if view == "compare":
+        if len(st.session_state.get("comparison_area_ids", [])) >= 2:
+            render_compare_view(panel, cuisine, plan)
+            return
+        st.session_state["workspace_view"] = "explore"
+        view = "explore"
 
     site = None
     report = lot = ped = result = landscape = None
     verdicts, fit, band, headline, quality = [], None, None, "", None
-    radius = st.session_state.get("ws_radius", config.DEFAULT_RADIUS_M)
+    # ws_radius may have been garbage-collected by a run where the slider
+    # did not render (Method view, landing) — the mirror is the durable copy.
+    # No setdefault here: pre-creating the key would make the toolbar's
+    # mirror re-seed unreachable and silently reset the radius to default.
+    radius = st.session_state.get(
+        "ws_radius",
+        st.session_state.get("_radius_mirror", config.DEFAULT_RADIUS_M))
 
     if mode == "site" and address:
         try:
@@ -2290,28 +3850,50 @@ def main() -> None:
         ped = context.nearest_pedestrian(ped_sites, site["lat"], site["lon"])
         result = score_cached(report, panel, lot, ped, radius,
                               (site["lat"], site["lon"], cuisine, radius, key))
-        landscape = competitors_cached(
-            site["lat"], site["lon"], cuisine,
+        # The Google text query is built deterministically from EXPLICIT
+        # plan fields — "Italian brunch", "French bakery" — so a stated
+        # concept sharpens the live layer without any new API.
+        gq = google_concept_query(cuisine,
+                                  plan.concept if plan else None)
+        landscape = (competitors_cached(
+            site["lat"], site["lon"], gq,
             google_places.DEFAULT_RADIUS_M, site, google_api_key())
+            if gq else None)
         verdicts = narrative.component_verdicts(result)
         fit = narrative.fit_score(result)
         band = narrative.fit_band(fit)
-        headline = narrative.headline(verdicts, fit, cuisine)
+        headline = narrative.headline(verdicts, fit,
+                                      cuisine or "restaurant")
         quality = narrative.evidence_quality(result, report, landscape)
         if site is not None and not st.session_state.get("selected_area"):
             code = nta_index().locate(site["lat"], site["lon"])
     area_ctx = (site_area_context(panel, site, cuisine, landscape)
                 if site is not None else {"nta_code": None})
 
-    # ---------------- discovery ranking (deterministic) ----------------------
+    # -------- discovery ranking (deterministic, preference-aware) ----------
+    # Core fit stays the same validated evidence framework for every user;
+    # explicit preferences only reorder DISCOVERY (the user named no area)
+    # via a transparent ±10 per stated-preference match/conflict, and both
+    # numbers are always shown separately (spec sections 63–65).
     top_matches = None
+    prefs_active = 0
     if mode == "discovery":
         borough = st.session_state.get("discovery_borough")
-        fit_table = concept_fit_cached(panel, cuisine)
-        dens = density_cached(panel, cuisine)
+        # No cuisine: rank on CONCEPT-INDEPENDENT evidence — overall
+        # restaurant persistence on the same 50-neutral scale, honestly
+        # labeled; concept-specific fit is simply not claimed.
+        if cuisine:
+            fit_table = concept_fit_cached(panel, cuisine)
+            dens = density_cached(panel, cuisine)
+        else:
+            fit_table = conceptfree_fit_cached(panel)
+            dens = None
         names = nta_names()
         boroughs = {c: f["borough"] for c, f in nta_index().features.items()}
-        plan = st.session_state.get("confirmed_plan")
+        prefs_active = sum(1 for v in (
+            plan.foot_traffic_preference, plan.competition_tolerance,
+            plan.income_preference, plan.restaurant_density_preference)
+            if v) if plan is not None else 0
         rows = []
         for code in fit_table.index:
             if borough and boroughs.get(code) != borough:
@@ -2319,50 +3901,44 @@ def main() -> None:
             frow = fit_table.loc[code]
             if frow["band"] == "Limited evidence" or pd.isna(frow["fit_index"]):
                 continue
-            sat = areas.competitor_saturation(
-                int(dens.loc[code, "active_same"]) if code in dens.index else 0,
-                float(dens.loc[code, "density_percentile"])
-                if code in dens.index else None)
-            gap = areas.opportunity_gap(frow["band"], sat["band"])
-            score = float(frow["fit_index"])
-            if plan is not None and plan.competition_tolerance == "low":
-                score += {"Low": 10, "Moderate": 0, "High": -10}.get(
-                    sat["band"], 0)
+            if dens is not None:
+                sat = areas.competitor_saturation(
+                    int(dens.loc[code, "active_same"])
+                    if code in dens.index else 0,
+                    float(dens.loc[code, "density_percentile"])
+                    if code in dens.index else None)
+            else:
+                sat = {"band": None}
+            gap = (areas.opportunity_gap(frow["band"], sat["band"])
+                   if cuisine else {"band": "Insufficient evidence"})
+            core = float(frow["fit_index"])
+            adjusted, matches, conflicts, measurable = core, 0, 0, 0
+            if prefs_active:
+                alignment = preference_alignment(
+                    plan, sat["band"], income_percentile_cached(code),
+                    float(dens.loc[code, "density_percentile"])
+                    if dens is not None and code in dens.index else None,
+                    area_ped_context(code)["band"])
+                matches = sum(r["status"] == "match" for r in alignment)
+                conflicts = sum(r["status"] == "conflict" for r in alignment)
+                measurable = sum(r["status"] != "unmeasured"
+                                 for r in alignment)
+                adjusted = core + 10 * matches - 10 * conflicts
             rows.append(dict(code=code, name=names.get(code, code),
-                             fit=score, band=frow["band"],
-                             competition=sat["band"], gap=gap["band"]))
+                             fit=adjusted, core=core, band=frow["band"],
+                             competition=sat["band"], gap=gap["band"],
+                             align=(matches, measurable),
+                             conflicts=conflicts))
         rows.sort(key=lambda r: -r["fit"])
         top_matches = rows[:3]
 
-    # ---------------- left nav ----------------------------------------------
-    with st.sidebar:
-        st.markdown("### Siting")
-        ui.eyebrow({"site": "Site analysis", "area": "Area analysis",
-                    "discovery": "Discovery"}[mode])
-        if site is not None:
-            st.caption(f"**{site['label']}**")
-        if st.button("New search", width="stretch"):
-            for k in ("selected_area", "selected_restaurant",
-                      "workspace_mode", "discovery_borough"):
-                st.session_state.pop(k, None)
-            st.session_state["stage"] = "landing"
-            st.rerun()
-        if mode == "site":
-            st.session_state["ws_radius"] = st.slider(
-                "Site radius (m)", 200, 1500, radius, step=50)
-        st.divider()
-        ui.eyebrow("Data")
-        status = [("DOHMH", True),
-                  ("Google", bool(getattr(landscape, "ok", False))),
-                  ("ACS", load_acs() is not None),
-                  ("PLUTO", lot is not None), ("DOT", ped is not None)]
-        for name, up in status:
-            st.caption(f"{'●' if up else '○'} {name}")
-        st.divider()
-        dev_trace = st.checkbox("Developer trace", value=False)
-
-    # ---------------- workspace -----------------------------------------------
-    map_col, panel_col = st.columns([0.62, 0.38], gap="medium")
+    # ---------------- workspace ---------------------------------------------
+    # Explore leads with the map; Assess leads with the analysis. Both are
+    # views over the SAME canonical selection state.
+    if view == "explore":
+        map_col, panel_col = st.columns([0.66, 0.34], gap="medium")
+    else:
+        map_col, panel_col = st.columns([0.44, 0.56], gap="medium")
     with map_col:
         render_map_workspace(panel, site, cuisine, landscape, report,
                              mode=mode, top_matches=top_matches)
@@ -2370,39 +3946,98 @@ def main() -> None:
     with panel_col:
         selected_area = st.session_state.get("selected_area")
         selected_rest = st.session_state.get("selected_restaurant")
+        render_compare_tray()
 
         if selected_rest:
             render_restaurant_card(panel, selected_rest, landscape, site)
+        elif view == "explore" and selected_area:
+            # In Explore, a selected area is the spatial context — even in
+            # site mode (Back-to-explore lands here); Assess still shows the
+            # full site analysis.
+            render_area_explorer(panel, selected_area, cuisine, compact=True)
         elif mode == "site" and site is not None:
-            render_site_panel(panel, site, cuisine, price, report, result,
-                              landscape, verdicts, fit, band, headline,
-                              quality, area_ctx, lot, ped)
+            if view == "explore":
+                ui.eyebrow(f"{cuisine or 'Restaurant'} · Site analysis")
+                st.markdown(f"#### {site['label']}")
+                st.markdown(
+                    f'<span style="font-size:30px;font-weight:600;">'
+                    f'{fit if fit is not None else "–"}</span>'
+                    f'<span style="font-size:15px;color:var(--text-muted);">'
+                    f' / 100</span>  <span style="font-size:14px;'
+                    f'color:var(--text-secondary);font-weight:600;">{band}'
+                    f'</span>', unsafe_allow_html=True)
+                st.caption("Location fit · relative index")
+                if st.button("Open full analysis →", width="stretch",
+                             key="open_assess", type="primary"):
+                    st.session_state["workspace_view"] = "assess"
+                    st.rerun()
+            else:
+                render_site_panel(panel, site, cuisine, price, report,
+                                  result, landscape, verdicts, fit, band,
+                                  headline, quality, area_ctx, lot, ped)
         elif selected_area:
-            render_area_explorer(panel, selected_area, cuisine)
+            render_area_explorer(panel, selected_area, cuisine,
+                                 compact=view == "explore")
         elif mode == "discovery" and top_matches is not None:
-            ui.eyebrow("Top matches")
-            st.markdown(f"### Where {cuisine} shows the best relative fit")
+            borough = st.session_state.get("discovery_borough")
+            ui.eyebrow("Preference-adjusted discovery" if prefs_active
+                       else "Top matches")
+            st.markdown((f"### Where {cuisine} shows the best relative fit"
+                         if cuisine else
+                         "### Where restaurants persist best")
+                        + (f" · {borough}" if borough else ""))
+            if not cuisine:
+                concept_word = (f"“{plan.concept}”" if plan and plan.concept
+                                else "your concept")
+                st.caption(f"No cuisine was specified, so this ranking uses "
+                           f"concept-independent evidence — overall "
+                           f"restaurant persistence, turnover and area "
+                           f"records. Current data cannot rank areas for "
+                           f"{concept_word} specifically.")
+            if not top_matches:
+                st.caption("No area currently meets the evidence gates for "
+                           "this concept"
+                           + (f" in {borough}" if borough else "")
+                           + " — the local samples are too small for a "
+                           "reliable comparison. Try a different concept"
+                           + (" or drop the borough constraint."
+                              if borough else "."))
             for i, match in enumerate(top_matches, 1):
-                if st.button(
-                        f"{i:02d}  {match['name']}  ·  {match['fit']:.0f} · "
-                        f"gap {match['gap']}",
-                        key=f"top_{match['code']}", width="stretch"):
+                label = (f"{i:02d}  {match['name']}  ·  Core fit "
+                         f"{match['core']:.0f}")
+                if prefs_active:
+                    matches_n, measurable = match["align"]
+                    label += f"  ·  {matches_n}/{measurable} align"
+                    if match.get("conflicts"):
+                        label += f", {match['conflicts']} conflict"
+                if st.button(label, key=f"top_{match['code']}",
+                             width="stretch"):
                     select_area(match["code"])
                     st.rerun()
-            st.caption("Relative fit under the same evidence rules — not a "
-                       "success ranking. Click a match to explore it.")
+            if prefs_active:
+                st.caption("Core fit uses the same evidence rules for "
+                           "everyone. Ordering = core fit +10 per stated "
+                           "priority that matches, −10 per conflict — "
+                           "shown, never hidden. Neither number is a "
+                           "success ranking.")
+            else:
+                st.caption("Relative fit under the same evidence rules — "
+                           "not a success ranking. Click a match to "
+                           "explore it.")
+            render_plan_usage(plan)
         else:
             st.caption("Click an area on the map to explore it.")
 
     if mode == "site" and site is not None:
-        if dev_trace:
+        if st.session_state.get("_dev_trace"):
             render_trace(site, key, report, result, landscape, ped, lot)
-        render_methodology(result, radius)
+        if view == "assess":
+            render_methodology(result, radius)
     else:
         with st.expander("Data & methodology"):
-            st.caption("Full methodology is shown in site analysis; sources: "
-                       "DOHMH, Google Places, 2024 ACS, PLUTO, NYC DOT, "
-                       "NYC Planning geographies.")
+            st.caption("Full methodology lives under Method in the top "
+                       "navigation; sources: DOHMH, Google Places, 2024 "
+                       "ACS, PLUTO, NYC DOT, NYC Planning geographies.")
 
 
 if __name__ == "__main__":

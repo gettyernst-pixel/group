@@ -124,10 +124,15 @@ def score_site(report: dict, panel: pd.DataFrame, lot: dict | None,
     same = area["cohort_same_cuisine"]
     city_same = city["cohort_same_cuisine"]
     if not same["total"] or city_same["rate"] is None:
+        # The plan may name no cuisine at all; the component is unavailable
+        # either way, but the sentence has to read correctly.
+        named = report["query"]["cuisine"]
+        subject = f"No {named} restaurant" if named else "No comparable "\
+                                                         "restaurant"
         comps.append(_unavailable(
             "cuisine_track_record", "Track record for this cuisine nearby",
-            f"No {report['query']['cuisine']} restaurant near here appears in "
-            f"the 2011-2017 archive, so there is no local cohort to follow."))
+            f"{subject} near here appears in the 2011-2017 archive, so "
+            f"there is no local cohort to follow."))
     else:
         # Ask the same question the comparison cards ask, with the same test:
         # is the local rate DISTINGUISHABLE from the citywide rate at this

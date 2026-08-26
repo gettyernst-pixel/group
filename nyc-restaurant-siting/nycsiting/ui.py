@@ -25,33 +25,6 @@ def esc(value: object) -> str:
 
 
 # ---------------------------------------------------------------- shell
-def page_header(stage: str, simulate_enabled: bool) -> None:
-    """
-    Wordmark + stage progression. Stages communicate where the user is;
-    Simulate stays faint until an assessment exists to simulate from.
-    """
-    def cls(name: str) -> str:
-        order = ["explore", "assess", "simulate"]
-        if name == stage:
-            return "jx-stage active"
-        if name == "simulate" and not simulate_enabled:
-            return "jx-stage"
-        if order.index(name) < order.index(stage):
-            return "jx-stage done"
-        return "jx-stage"
-
-    st.markdown(
-        f"""<div class="jx-header">
-          <div class="jx-wordmark">Siting</div>
-          <div class="jx-stages">
-            <span class="{cls('explore')}">Explore</span>
-            <span class="{cls('assess')}">Assess</span>
-            <span class="{cls('simulate')}">Simulate</span>
-          </div>
-          <div class="jx-header-right">Methodology below</div>
-        </div>""", unsafe_allow_html=True)
-
-
 def eyebrow(text: str, number: str | None = None) -> None:
     num = f'<span class="num">[{esc(number)}]</span>' if number else ""
     st.markdown(f'<div class="jx-eyebrow">{num}{esc(text)}</div>',
@@ -68,6 +41,17 @@ def section(number: str, title: str, question: str | None = None) -> None:
     eyebrow(title, number)
     if question:
         st.markdown(f"## {question}")
+
+
+def plan_chips(values: list[str]) -> None:
+    """YOUR PLAN as compact chips — the user's own explicit inputs, visibly
+    still driving the analysis. Never a paragraph, never hidden defaults."""
+    if not values:
+        return
+    inner = "".join(f'<span class="chip">{esc(v)}</span>' for v in values)
+    st.markdown(
+        f'<div class="jx-plan"><span class="k">Your plan</span>{inner}</div>',
+        unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- context

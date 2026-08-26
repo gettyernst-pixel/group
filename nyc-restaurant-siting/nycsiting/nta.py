@@ -15,6 +15,8 @@ its output contains no NTA-level column with "median" in the name.
 """
 from __future__ import annotations
 
+import re
+
 import pandas as pd
 
 from . import config
@@ -22,6 +24,61 @@ from . import config
 #: NTAType codes that are not residential neighbourhoods (parks, airports,
 #: cemeteries, Rikers...). Kept in the tables, flagged for display layers.
 NON_RESIDENTIAL_TYPES = {"5", "6", "7", "8", "9"}
+
+
+# ------------------------------------------------------------------ names
+def _norm(text: str) -> str:
+    """Case, punctuation and spacing folded away — 'SoHo,' == 'soho'."""
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^a-z0-9 ]", " ", str(text).lower())).strip()
+
+
+def name_segments(name: str) -> list[str]:
+    """
+    A 2020 NTA name is a hyphen-joined list of neighbourhoods, sometimes with
+    a parenthetical qualifier: "Murray Hill-Kips Bay", "Upper West Side
+    (Central)". The segments are the names people actually say.
+    """
+    parts = re.split(r"-|–|/", re.sub(r"\([^)]*\)", " ", str(name)))
+    return [seg for seg in (_norm(p) for p in parts) if seg]
+
+
+def resolve_area_name(text: str, names: dict[str, str],
+                      boroughs: dict[str, str] | None = None,
+                      borough: str | None = None) -> list[str]:
+    """
+    Deterministic name -> candidate NTA codes, against the app's OWN 2020
+    geography only — never a language model's world knowledge.
+
+    Tiers, first non-empty wins: exact full name; exact segment of a
+    compound name ("Murray Hill" -> Murray Hill-Kips Bay AND Murray
+    Hill-Broadway Flushing); the query as whole words inside a name; a name
+    as whole words inside the query. A borough, when the user gave one,
+    filters candidates; several survivors mean genuinely ambiguous — the
+    caller shows the alternatives rather than guessing.
+    """
+    q = _norm(text or "")
+    if not q:
+        return []
+    normed = {code: _norm(name) for code, name in names.items()}
+    tiers = (
+        [c for c, n in normed.items() if n == q],
+        [c for c, name in names.items() if q in name_segments(name)],
+        [c for c, n in normed.items() if f" {q} " in f" {n} "],
+        [c for c, n in normed.items() if n and f" {n} " in f" {q} "],
+        # A name segment inside the query ("Flushing Main Street", "the
+        # Murray Hill area"). Safe because callers only pass location
+        # phrases — free prose goes through the parsers, never here.
+        [c for c, name in names.items()
+         if any(len(seg) >= 4 and f" {seg} " in f" {q} "
+                for seg in name_segments(name))],
+    )
+    candidates = next((tier for tier in tiers if tier), [])
+    if borough and boroughs:
+        narrowed = [c for c in candidates if boroughs.get(c) == borough]
+        if narrowed:
+            candidates = narrowed
+    return sorted(candidates)
 
 
 def load_equivalency(path=None) -> pd.DataFrame:

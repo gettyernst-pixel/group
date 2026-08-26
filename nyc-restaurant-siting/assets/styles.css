@@ -85,14 +85,6 @@ h1, h2, h3, h4 { font-weight: 400 !important; color: var(--text); }
 }
 .jx-wordmark { font-size: 16px; font-weight: 600; color: var(--text);
                letter-spacing: -0.01em; }
-.jx-stages { display: flex; gap: 28px; }
-.jx-stage {
-    font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em;
-    text-transform: uppercase; color: var(--text-faint);
-    padding: 4px 0; border-bottom: 2px solid transparent;
-}
-.jx-stage.done { color: var(--text-muted); }
-.jx-stage.active { color: var(--text); border-bottom-color: var(--accent); }
 .jx-header-right { font-family: var(--mono); font-size: 12px;
                    color: var(--text-muted); letter-spacing: 0.05em; }
 
@@ -320,3 +312,169 @@ hr { border-color: var(--hairline) !important; margin: 56px 0 !important; }
   font-size: 13px !important;
 }
 .jx-eyebrow { letter-spacing: 0.06em; }
+
+
+/* ==== v5: button system — primary is unmistakably clickable ==== */
+/* stDownloadButton is included deliberately: without it the report download
+   inherits the legacy graphite rule and renders dark-on-dark. */
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"],
+[data-testid="stDownloadButton"] button[kind="primary"] {
+  background: var(--accent) !important; color: #07111F !important;
+  font-weight: 650 !important; min-height: 44px;
+  border: none !important; border-radius: 8px !important;
+  cursor: pointer;
+}
+[data-testid="stDownloadButton"] button[kind="primary"] p {
+  color: #07111F !important; font-weight: 650 !important;
+}
+.stButton > button[kind="primary"]:hover,
+.stFormSubmitButton > button[kind="primary"]:hover,
+[data-testid="stDownloadButton"] button[kind="primary"]:hover {
+  background: #7DF0C2 !important;
+}
+.stButton > button[kind="secondary"] {
+  background: var(--surface) !important; color: var(--text) !important;
+  border: 1px solid rgba(255,255,255,0.22) !important;
+  border-radius: 8px !important; min-height: 40px; cursor: pointer;
+}
+.stButton > button[kind="secondary"]:hover {
+  border-color: var(--accent) !important; background: #112238 !important;
+}
+.stButton > button:disabled, .stFormSubmitButton > button:disabled {
+  opacity: 0.45 !important; cursor: not-allowed;
+}
+
+/* ==== v5: signal grid symmetry — exact 2 columns, equal cells ==== */
+.jx-signals { display: grid !important;
+  grid-template-columns: 1fr 1fr; gap: 0; }
+.jx-signals .cell { min-width: 0; border-bottom: 1px solid var(--hairline);
+  padding: 10px 12px; }
+.jx-signals .cell:nth-child(odd) { border-right: 1px solid var(--hairline); }
+
+/* ==== v5: panel overflow — nothing escapes sideways, ever ==== */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child,
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child * {
+  max-width: 100%; min-width: 0;
+}
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
+  overflow-x: hidden;
+}
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child
+  [data-testid="stMetricValue"] { font-size: 20px !important; }
+.jx-strip { flex-wrap: wrap; }
+.jx-strip .cell { min-width: 45%; flex: 1 1 45%; }
+.jx-bench .r { flex-wrap: wrap; }
+
+/* v5: tab bars stay put while the panel scrolls */
+[data-testid="stColumn"]:last-child [data-baseweb="tab-list"] {
+  position: sticky; top: 0; z-index: 5;
+  background: var(--canvas); padding-top: 2px;
+}
+
+/* form-submit primary: force the navy label (baseweb overrides otherwise) */
+[data-testid="stFormSubmitButton"] button,
+[data-testid="stFormSubmitButton"] button p {
+  color: #07111F !important; font-weight: 650 !important;
+}
+[data-testid="stFormSubmitButton"] button {
+  background: var(--accent) !important; border: none !important;
+  border-radius: 8px !important; min-height: 44px;
+}
+[data-testid="stFormSubmitButton"] button:hover { background: #7DF0C2 !important; }
+
+/* ==========================================================================
+   v6 — split-word fixes, panel row layout, plan chips, nav, segmented filter
+   ========================================================================== */
+
+/* Text wraps at word boundaries, never inside words. overflow-wrap:anywhere
+   is reserved for long unbreakable identifiers only (none rendered today). */
+[data-testid="stMarkdownContainer"], .jx-row, .jx-bench, .jx-strip,
+.jx-signals, .jx-reco, .jx-comp {
+  word-break: normal; overflow-wrap: normal;
+}
+
+/* Evidence rows inside the intelligence panel: the fixed 240px/180px grid
+   crushed prose to one-word-per-line at panel widths. Two columns — label
+   and status share the first line, the conclusion gets the FULL width. */
+[data-testid="stColumn"]:last-child .jx-row {
+  grid-template-columns: 1fr auto; gap: 6px 12px; padding: 14px 0;
+}
+[data-testid="stColumn"]:last-child .jx-row .body {
+  grid-column: 1 / -1; grid-row: 2; min-width: 180px;
+}
+[data-testid="stColumn"]:last-child .jx-row .status { text-align: right; }
+[data-testid="stColumn"]:last-child .jx-status {
+  padding: 3px 8px; font-size: 10.5px;
+}
+
+/* Any content cell that can hold a sentence keeps a readable floor. */
+.jx-row .body, .jx-bench .r .k { min-width: 180px; }
+.jx-bench .r .k { flex: 1 1 180px; }
+.jx-bench .r .v { text-align: right; flex: 0 1 auto; }
+
+/* At narrow panel widths: label/value rows and 2-col metric pairs only. */
+@media (max-width: 430px) {
+  .jx-strip .cell { min-width: 100%; flex-basis: 100%; }
+  .jx-row { grid-template-columns: 1fr auto; }
+}
+
+/* your-plan chips */
+.jx-plan { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin: 2px 0 10px 0; }
+.jx-plan .k { font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--text-muted); margin-right: 6px; }
+.jx-plan .chip { font-size: 12.5px; color: var(--text);
+  background: var(--accent-soft); border: 1px solid rgba(101,227,176,0.35);
+  border-radius: 999px; padding: 3px 12px; white-space: nowrap; }
+
+/* top workspace nav: compact buttons, primary = active view */
+.st-key-nav_explore button, .st-key-nav_assess button,
+.st-key-nav_method button, .st-key-nav_new button {
+  min-height: 36px !important; padding: 2px 10px !important;
+  font-size: 13px !important;
+}
+/* v7: the dashed treatment belonged to the old in-workspace New search
+   button; the top-header pair is styled as product-mode buttons instead. */
+
+/* RESTAURANTS filter as a segmented control: [ Similar ][ All ] */
+[data-testid="stRadio"] [role="radiogroup"] {
+  display: inline-flex; gap: 0; border: 1px solid var(--border);
+  border-radius: 8px; overflow: hidden; background: var(--surface);
+}
+[data-testid="stRadio"] [role="radiogroup"] label {
+  margin: 0 !important; padding: 8px 16px !important; cursor: pointer;
+  border-right: 1px solid var(--border);
+}
+[data-testid="stRadio"] [role="radiogroup"] label:last-child {
+  border-right: none;
+}
+/* hide the radio circle; the surface itself signals selection */
+[data-testid="stRadio"] [role="radiogroup"] label > div:first-child {
+  display: none;
+}
+[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+[data-testid="stRadio"] [role="radiogroup"] label:has(input:checked) p {
+  color: var(--accent) !important; font-weight: 600;
+}
+
+/* map toolbar controls share one height and baseline */
+[data-testid="stRadio"] { padding-top: 2px; }
+
+/* ==== v7: comparison tray + top header ==== */
+.st-key-compare_tray { background: var(--surface) !important;
+  border: 1px solid rgba(241,182,108,0.45) !important; }
+.st-key-compare_tray [data-testid="stMarkdownContainer"] p {
+  font-size: 14px; margin: 0; }
+.st-key-compare_tray button { min-height: 30px !important;
+  padding: 0 8px !important; }
+.st-key-cmp_go button { min-height: 38px !important; }
+.st-key-nav_new button, .st-key-nav_workspace button {
+  min-height: 34px !important; font-size: 12.5px !important;
+  letter-spacing: 0.04em; text-transform: uppercase;
+}
+.st-key-nav_compare button { min-height: 36px !important;
+  padding: 2px 10px !important; font-size: 13px !important; }

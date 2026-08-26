@@ -34,6 +34,16 @@ MIN_CUISINE_SAMPLE = 8
 #: NYC restaurants — rarities produce noise, not fit.
 MIN_CITYWIDE_CUISINE = 150
 
+#: The fit index maps the local-vs-citywide survival gap onto the 50-neutral
+#: scale: FIT_NEUTRAL + gap * FIT_SLOPE, clipped to [0, 100]. Named here so
+#: the in-app Method page renders the ACTUAL formula and can never drift.
+#: A consequence worth stating out loud: any gap of at least
+#: (100 - FIT_NEUTRAL) / FIT_SLOPE (= +20 points) hits the cap, so several
+#: concepts can share a 100 — 100 is the top of the relative scale, not a
+#: claim that one concept beats all others, and not predictive of outcomes.
+FIT_NEUTRAL = 50
+FIT_SLOPE = 250
+
 FIT_BANDS = ("Strong", "Promising", "Mixed", "Limited evidence")
 SATURATION_BANDS = ("Low", "Moderate", "High")
 GAP_BANDS = ("High", "Moderate", "Low", "Insufficient evidence")
@@ -118,7 +128,7 @@ def area_concept_fit(panel: pd.DataFrame, assignment: pd.Series,
             rate = survived / n
             verdict = rate_differs(survived, n, baseline)
             gap = rate - baseline
-            index = float(np.clip(50 + gap * 250, 0, 100))
+            index = float(np.clip(FIT_NEUTRAL + gap * FIT_SLOPE, 0, 100))
             if verdict == "above":
                 band = "Strong"
             elif gap > 0:

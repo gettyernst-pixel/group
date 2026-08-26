@@ -45,7 +45,7 @@ def run(address: str, cuisine: str) -> AppTest:
     at.run()
     at.text_area[0].set_value(f"{cuisine} restaurant at {address}")
     at.run()
-    at = at.button[0].click().run()          # Continue -> confirm stage
+    at = next(b for b in at.button if "Continue" in str(b.label)).click().run()          # Continue -> confirm stage
     assert at.session_state["stage"] == "confirm", "parse did not reach confirm"
     at.selectbox[0].set_value(cuisine)
     analyze = next(b for b in at.button if "Analyze" in b.label)
@@ -217,13 +217,18 @@ def test_landing_page_leads_with_the_product_not_the_data():
         assert jargon not in body
 
 
-def test_evaluate_button_is_disabled_until_an_address_is_typed():
+def test_continue_is_always_clickable_and_guards_empty_input():
+    """v5 contract: the submit button is NEVER disabled (the old
+    disabled-until-committed pattern caused the Cmd+Enter bug). An empty
+    submit shows an inline nudge and stays on the landing page."""
     at = AppTest.from_file(APP, default_timeout=300)
     at.run()
-    assert at.button[0].disabled            # empty plan box
-    at.text_area[0].set_value("Italian in 10003")
-    at.run()
-    assert not at.button[0].disabled
+    go = next(b for b in at.button if "Continue" in str(b.label))
+    assert not go.disabled
+    at = go.click().run()
+    assert at.session_state["stage"] == "landing"
+    caps = " ".join(c.value for c in at.caption)
+    assert "Tell us a little" in caps
 
 
 def _legacy_landing_gating():
@@ -275,7 +280,12 @@ def test_methodology_is_present_but_last():
 # --- the simulate stage ------------------------------------------------------
 def to_simulate(address="195 Bowery, Manhattan", cuisine="Italian"):
     at = run(address, cuisine)
-    cta = next(b for b in at.button if "Simulate opening here" in b.label)
+    # Simulation is gated out of the user product; regression tests keep the
+    # validated engine covered through the developer flag.
+    at.session_state["_enable_sim"] = True
+    at = at.run()
+    cta = next(b for b in at.button if "Simulate opening here" in b.label
+               or b.label == "Simulate →")
     return cta.click().run()
 
 
@@ -321,7 +331,7 @@ def test_changing_location_invalidates_simulation_results():
     at = back.click().run()
     at.text_area[0].set_value("Italian restaurant at 42 Broadway, Manhattan")
     at.run()
-    at = at.button[0].click().run()          # -> confirm
+    at = next(b for b in at.button if "Continue" in str(b.label)).click().run()          # -> confirm
     analyze = next(b for b in at.button if "Analyze" in b.label)
     at = analyze.click().run()
     cta = next(b for b in at.button if "Simulate opening here" in b.label)
@@ -346,7 +356,7 @@ def to_confirm(text: str) -> AppTest:
     at.run()
     at.text_area[0].set_value(text)
     at.run()
-    return at.button[0].click().run()
+    return next(b for b in at.button if "Continue" in str(b.label)).click().run()
 
 
 def test_confirmation_required_before_analysis():
@@ -400,7 +410,7 @@ def test_new_plan_invalidates_previous_state():
     at = back.click().run()
     at.text_area[0].set_value("Thai restaurant in Queens")
     at.run()
-    at = at.button[0].click().run()
+    at = next(b for b in at.button if "Continue" in str(b.label)).click().run()
     assert not st_get(at, "plan_confirmed")
     assert st_get(at, "sim_results") is None
 
@@ -416,9 +426,10 @@ def test_plan_spend_and_seats_reach_the_simulator():
     at.session_state["address"] = "195 Bowery, Manhattan"
     at.session_state["cuisine"] = "Italian"
     at.session_state["sim_location_id"] = ("x", "Italian")
+    at.session_state["_enable_sim"] = True
     at.session_state["stage"] = "simulate"
     at = at.run()
-    if at.exception:            # simulate page geocodes; outage-tolerant
+    if at.exception or at.error:    # simulate page geocodes; outage-tolerant
         pytest.skip("geocoding unavailable")
     spends = [n.value for n in at.number_input]
     assert 70.0 in spends and 60 in [int(v) for v in spends]
@@ -527,3 +538,107 @@ def test_no_need_address_stage_exists():
     import inspect
     assert "need_address_page" not in dir(app_module)
     assert "need_address" not in inspect.getsource(app_module.main)
+
+
+# --- v5: final polish battery ------------------------------------------------
+def test_continue_uses_a_form_not_stale_state():
+    """The Cmd+Enter bug: a plain text_area + disabled button pair only sees
+    text after blur. A form submit commits the value in the same run."""
+    import inspect
+    import app as app_module
+    src = inspect.getsource(app_module.landing_page)
+    assert 'st.form(' in src
+    assert "form_submit_button" in src
+    assert "disabled=not text" not in src
+
+
+def test_simulation_absent_from_user_ui_but_engine_intact():
+    at = run("195 Bowery, Manhattan", "Italian")
+    assert not any("Simulate" in b.label for b in at.button)
+    # engine intact
+    from nycsiting import financial_simulation as fs
+    assert fs.calculate_daily_capacity is not None
+    # and the stage redirects without the flag
+    at.session_state["stage"] = "simulate"
+    at = at.run()
+    assert at.session_state["stage"] == "results"
+
+
+def test_back_to_explore_preserves_concept_and_area():
+    at = run("195 Bowery, Manhattan", "Italian")
+    back = next(b for b in at.button if "Back to explore" in b.label)
+    at = back.click().run()
+    assert not at.exception
+    # V6: non-destructive — the view flips to explore and the site's area is
+    # selected, but the site analysis stays one Assess click away.
+    assert at.session_state["workspace_mode"] == "site"
+    assert at.session_state["workspace_view"] == "explore"
+    assert at.session_state["cuisine"] == "Italian"
+    assert at.session_state["selected_area"]          # site's own NTA
+    # plan retained: no parser rerun, no landing bounce
+    assert at.session_state["stage"] == "results"
+    # and Assess really does return the full site analysis
+    at = next(b for b in at.button if b.label == "Assess").click().run()
+    body = " ".join(m.value for m in at.markdown)
+    assert "Site analysis" in body
+
+
+def test_view_key_changes_only_with_selection():
+    """The fit-to-bounds runs once per new selection; reruns hold the view."""
+    import inspect
+    import app as app_module
+    src = inspect.getsource(app_module.render_map_workspace)
+    assert "uirevision" in src
+    assert "last_fitted_area" in src
+
+
+def test_scores_render_as_relative_index_never_probability():
+    at = run("195 Bowery, Manhattan", "Italian")
+    body = " ".join(m.value for m in at.markdown) + " ".join(
+        c.value for c in at.caption)
+    assert "/ 100" in body
+    assert "relative" in body.lower()
+    assert "probability of restaurant success" in body or \
+        "not a probability" in body
+    for banned in ("success probability", "chance of success",
+                   "survival probability"):
+        assert banned not in body.lower()
+
+
+def test_method_drawer_reflects_actual_constants():
+    from nycsiting import scoring
+    at = run("195 Bowery, Manhattan", "Italian")
+    # V6: Method is a top-nav view, never a sidebar drawer.
+    at = next(b for b in at.button if b.label == "Method").click().run()
+    assert not at.exception, at.exception
+    body = " ".join(m.value for m in at.markdown) + " ".join(
+        c.value for c in at.caption)
+    for weight in scoring.WEIGHTS.values():
+        assert f"{weight}%" in body
+    assert "editorial" in body
+
+
+def test_cuisine_language_is_plain():
+    at = run("195 Bowery, Manhattan", "Italian")
+    body = " ".join(m.value for m in at.markdown) + " ".join(
+        c.value for c in at.caption)
+    assert "not distinguishable" not in body
+    assert "No clear difference" in body or "observed persistence" in body.lower()
+
+
+def test_competition_fallback_shows_public_inventory(monkeypatch):
+    import streamlit as st
+    from nycsiting import google_places
+    def dead(*a, **k):
+        return google_places.CompetitorLandscape(
+            ok=False, reason="auth",
+            message="Google rejected the API key as invalid")
+    monkeypatch.setattr(google_places, "fetch_landscape", dead)
+    # Earlier journeys in this process may have cached a LIVE landscape for
+    # these coordinates — the monkeypatch only matters on a cache miss.
+    st.cache_data.clear()
+    at = run("195 Bowery, Manhattan", "Italian")
+    labels = [m.label for m in at.metric]
+    assert "Similar concepts nearby" in labels     # DOHMH fallback metrics
+    infos = " ".join(i.value for i in at.info)
+    assert "temporarily unavailable" in infos

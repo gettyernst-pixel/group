@@ -94,6 +94,25 @@ def point_in_multipolygon(lon: float, lat: float, polygons) -> bool:
     return False
 
 
+def simplify_ring(ring: list[tuple[float, float]],
+                  tolerance: float = 0.00025) -> list[tuple[float, float]]:
+    """
+    Display-only decimation: drop vertices closer than ~tolerance degrees
+    (~25m) to the last kept vertex. Analytical point-in-polygon always uses
+    the ORIGINAL rings — this exists purely so the map does not ship an
+    18MB figure to the browser on every rerun.
+    """
+    if len(ring) <= 8:
+        return ring
+    kept = [ring[0]]
+    for pt in ring[1:-1]:
+        last = kept[-1]
+        if abs(pt[0] - last[0]) + abs(pt[1] - last[1]) >= tolerance:
+            kept.append(pt)
+    kept.append(ring[-1])
+    return kept if len(kept) >= 4 else ring
+
+
 # ------------------------------------------------------------------ features
 class NTAIndex:
     """Parsed polygons + bounding boxes, built once from the polygon file."""
@@ -119,10 +138,17 @@ class NTAIndex:
                 return code
         return None
 
-    def to_geojson(self) -> dict:
-        """The 262 areas as a FeatureCollection for choropleth rendering."""
+    def to_geojson(self, simplified: bool = True) -> dict:
+        """
+        The 262 areas as a FeatureCollection for choropleth rendering.
+        Simplified geometry by default — display only; spatial membership
+        always runs on the original rings.
+        """
         features = []
         for code, f in self.features.items():
+            polys = ([[simplify_ring(ring) for ring in poly]
+                      for poly in f["polygons"]] if simplified
+                     else f["polygons"])
             features.append({
                 "type": "Feature", "id": code,
                 "properties": {"nta_code": code, "name": f["name"],
@@ -131,7 +157,7 @@ class NTAIndex:
                     "type": "MultiPolygon",
                     "coordinates": [[[list(pt) for pt in ring]
                                      for ring in poly]
-                                    for poly in f["polygons"]]}})
+                                    for poly in polys]}})
         return {"type": "FeatureCollection", "features": features}
 
 
