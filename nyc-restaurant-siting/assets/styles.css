@@ -175,7 +175,11 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 [data-testid="stSlider"] [role="slider"] { background: var(--graphite) !important; }
 [data-testid="stSlider"] [data-baseweb="slider"] div[style*="background"] { border-radius: 0 !important; }
 
-hr { border-color: var(--hairline) !important; margin: 56px 0 !important; }
+/* 56px above AND below a 1px rule spent 112px of vertical space on a
+   hairline, and the !important beat the inline margin the header
+   divider asked for — which is most of why the landing hero sat two
+   thirds of the way down the viewport. */
+hr { border-color: var(--hairline) !important; margin: 14px 0 !important; }
 [data-testid="stHeaderActionElements"] { display: none; }
 
 /* ---- product components --------------------------------------------------- */
@@ -283,27 +287,22 @@ hr { border-color: var(--hairline) !important; margin: 56px 0 !important; }
 /* ==== v4 workspace shell: persistent map, internally-scrolling panel ==== */
 .block-container { max-width: 100% !important; padding: 0.6rem 1.1rem 0 1.1rem !important; }
 
-/* map column: sticky so it never scrolls away with the panel */
-[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
-  position: sticky; top: 0.4rem; align-self: flex-start; min-width: 0;
-}
-/* intelligence panel: readable floor, internal scroll, never one-word wrap */
-[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
-  min-width: 380px; max-width: 460px;
-  max-height: calc(100vh - 80px); overflow-y: auto; padding-right: 6px;
-}
+/* SUPERSEDED BY v8.2 (.st-key-sticky_map). The v4 rules that lived here
+   applied to EVERY horizontal block: they made each row's first column
+   sticky and turned each row's last column into a 460px-wide box with
+   `max-height: calc(100vh - 80px); overflow-y: auto`.
+
+   Measured consequences before removal: the analysis pane held 2032px of
+   content in a 740px box, so most of a site or area analysis was reachable
+   only through a nested scrollbar inside the column — and the max-width
+   capped every last column in the app, including the toolbar's, which is
+   part of why the Restaurants control had no room. The replacement is
+   scoped to the one container that should be sticky, and lets the page
+   scroll normally (see "v8.2: sticky map" below).
+
+   The metric-size rule is kept, retargeted at the analysis pane only. */
 [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child
   [data-testid="stMetricValue"] { font-size: 22px !important; }
-
-/* below the side-by-side breakpoint, columns stack: release the clamp */
-@media (max-width: 900px) {
-  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:last-child {
-    min-width: 0; max-width: none; max-height: none; overflow-y: visible;
-  }
-  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:first-child {
-    position: static;
-  }
-}
 
 /* ==== v4 typography: sans-first, monospace only for micro-metadata ==== */
 .jx-row .cat, .jx-strip .k, .jx-signals .k {
@@ -517,4 +516,289 @@ hr { border-color: var(--hairline) !important; margin: 56px 0 !important; }
   background: var(--accent-soft) !important;
   box-shadow: inset 0 0 0 1px var(--accent) !important;
   color: var(--accent) !important; font-weight: 600 !important;
+}
+
+/* ==== v8: adjacent-button symmetry ====================================
+   Buttons that sit side by side must read as one row, not as separate
+   controls that happen to be near each other. Two things caused the
+   raggedness: unequal st.columns ratios, and a long label wrapping onto a
+   second line while its neighbour stayed on one — which made one button
+   physically taller than the button beside it.
+
+   ui.button_row() fixes the widths (equal columns). These rules fix the
+   heights: every button in a horizontal block shares a min-height and
+   centres its label, so a wrapped label grows the row evenly rather than
+   knocking one button out of alignment. Stretching to 100% height makes
+   each button fill its column, which is what keeps their tops and bottoms
+   on the same line even when Streamlit adds a caption under one of them.
+
+   Scoped to horizontal blocks so stacked buttons keep their natural size. */
+[data-testid="stHorizontalBlock"] .stButton,
+[data-testid="stHorizontalBlock"] .stFormSubmitButton,
+[data-testid="stHorizontalBlock"] [data-testid="stDownloadButton"] {
+  height: 100%;
+  /* The WRAPPER must fill its column, not just the button inside it.
+     Measured: with equal 330px columns, a primary button's wrapper filled
+     330 while the secondary beside it sat at 324 — so two buttons in
+     genuinely equal columns still rendered 6px apart. !important because
+     Streamlit's own emotion class sizes the wrapper and would otherwise
+     win. Buttons that did not ask to stretch keep their content width
+     inside the full-width wrapper, so this widens the box, not them. */
+  width: 100% !important;
+}
+[data-testid="stHorizontalBlock"] .stButton > button,
+[data-testid="stHorizontalBlock"] .stFormSubmitButton > button,
+[data-testid="stHorizontalBlock"] [data-testid="stDownloadButton"] button {
+  min-height: 44px;
+  height: 100%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  line-height: 1.25;
+  white-space: normal;      /* wrap rather than clip a long label */
+}
+/* Streamlit spaces columns TWICE: the row is a flex container with a
+   16px gap, and each column additionally carries `padding: 0 6px 0 0`.
+   The padding is charged to the column's content box, so on a row whose
+   columns were both exactly 329.6px wide the buttons inside came out
+   329.5px and 323.6px — a visible 6px mismatch between two buttons that
+   are supposed to be identical. The flex gap already provides the
+   spacing, so the redundant padding is removed and the columns' content
+   boxes match their frames. */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+  padding-right: 0 !important;
+}
+/* Column children stretch, so two buttons in a row share a baseline even
+   when one column also holds a caption. */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+}
+/* Narrow viewports: Streamlit stacks the columns. Full width, never a
+   clipped label. */
+@media (max-width: 760px) {
+  [data-testid="stHorizontalBlock"] .stButton > button,
+  [data-testid="stHorizontalBlock"] .stFormSubmitButton > button {
+    width: 100% !important;
+  }
+}
+
+/* ==== v8: landing composition ========================================
+   The hero used to start below the fold-ish: a 40px spacer, a 50px mark,
+   eyebrow, a two-line display headline and an 18px spacer pushed the
+   prompt bar to roughly two-thirds down a 800px-tall viewport, and the
+   form stretched the full content width. This centres a deliberately
+   narrow column in the viewport, slightly above mathematical centre. */
+.jx-landing {
+  max-width: 760px;
+  margin: 0 auto;
+}
+.jx-landing-pad { height: 0; }
+
+/* The hero's own rhythm: the display headline carried a large top margin
+   that, stacked under the persistent header and its rule, pushed the
+   prompt below the visual centre. */
+.jx-landing-hero .jx-display { margin-top: 4px; }
+.jx-landing-hero .jx-eyebrow { margin-bottom: 2px; }
+
+/* ==== v8.2: workspace toolbar — one row, one height ==================
+   THE BUG THE PREVIOUS ATTEMPT MISSED: this Streamlit version renders
+   st.segmented_control as [data-testid="stButtonGroup"], NOT
+   "stSegmentedControl". Every rule written against the old name matched
+   nothing, so the group stayed display:block and its three options stacked
+   into a 132px tower beside two 68px dropdowns.
+
+   The contract, measured from the selectboxes: a 24px label, then a 40px
+   control. The segmented control must total the same 64-68px, with all
+   three options on ONE row. */
+/* The group and its radiogroup must both fill the column. Measured: the
+   group sat at 334px inside a 597px column because Streamlit sizes it to
+   content (flex: 0 1 auto), so the three options shared 334px and their
+   labels were clipped to "Exact conc…". Stretching the whole chain is what
+   actually gives each option its third of the column. */
+[data-testid="stElementContainer"]:has(> [data-testid="stButtonGroup"]) {
+  width: 100% !important;
+}
+[data-testid="stButtonGroup"] {
+  display: flex;
+  flex-direction: column;      /* label above, options below */
+  width: 100% !important;
+  flex: 1 1 auto !important;
+}
+[data-testid="stButtonGroup"] > div:not([data-testid="stWidgetLabel"]),
+[data-testid="stButtonGroup"] [role="group"],
+[data-testid="stButtonGroup"] [role="radiogroup"] {
+  display: flex !important;
+  flex-wrap: nowrap !important;
+  width: 100% !important;
+  min-width: max-content !important;
+  gap: 0;
+}
+[data-testid="stButtonGroup"] button {
+  /* 40px to match a selectbox's control exactly */
+  height: 40px !important;
+  min-height: 40px !important;
+  padding: 0 8px !important;
+  /* grow to share the row, but NEVER shrink below the label's own width:
+     `flex: 1 1 0` with `min-width: 0` let Streamlit's inner radiogroup
+     (which does not always inherit the group's full width) squeeze the
+     options until "Exact concept" rendered as "Exact conc…". Sizing from
+     content upwards makes clipping structurally impossible, whatever the
+     container ends up being. */
+  flex: 1 0 auto !important;
+  min-width: max-content !important;
+  white-space: nowrap !important;
+  font-size: 12.5px !important;
+  border-radius: 0 !important;
+  background: var(--surface) !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text-secondary) !important;
+  /* border-box so the selected state cannot change the box size */
+  box-sizing: border-box !important;
+}
+[data-testid="stButtonGroup"] button:first-of-type {
+  border-top-left-radius: 8px !important;
+  border-bottom-left-radius: 8px !important;
+}
+[data-testid="stButtonGroup"] button:last-of-type {
+  border-top-right-radius: 8px !important;
+  border-bottom-right-radius: 8px !important;
+}
+/* Selected: colour only. An added border or padding here would move every
+   neighbouring control by a pixel on each click. */
+[data-testid="stButtonGroup"] button[aria-checked="true"],
+[data-testid="stButtonGroup"] button[aria-pressed="true"],
+[data-testid="stButtonGroup"] button[kind="segmented_controlActive"] {
+  background: var(--accent-soft) !important;
+  box-shadow: inset 0 0 0 1px var(--accent) !important;
+  color: var(--accent) !important;
+  font-weight: 600 !important;
+}
+
+/* Every toolbar widget shares one label block, so the four control tops sit
+   on one line whatever the widget type. */
+.jx-toolbar + div [data-testid="stWidgetLabel"],
+[data-testid="stButtonGroup"] [data-testid="stWidgetLabel"],
+[data-testid="stSelectbox"] [data-testid="stWidgetLabel"] {
+  height: 24px;
+  display: flex;
+  align-items: flex-end;
+  margin-bottom: 4px;
+}
+/* The radius slider is structurally different (no bordered box), so it is
+   nudged onto the same optical line rather than left floating high. */
+[data-testid="stSlider"] { padding-top: 2px; }
+
+/* ==== v8.2: sticky map ==============================================
+   The map column stays put while the analysis beside it scrolls, so the
+   geography never leaves the screen and the left half never becomes a
+   blank dark region at the bottom of a long analysis.
+
+   Pure CSS: no scroll listener, no JS repositioning, and therefore no
+   Streamlit rerun from scrolling. `position: sticky` needs every ancestor
+   to avoid overflow/transform, which Streamlit's column wrappers satisfy;
+   the height is capped to the viewport so the map cannot outgrow the
+   window and strand its own bottom edge. */
+.st-key-sticky_map {
+  position: sticky;
+  top: 12px;
+  z-index: 1;               /* far below the loading overlay (999985) */
+}
+/* The COLUMN must stay full height and the container inside it sticks.
+   Getting this backwards is the classic sticky failure: shrink-wrapping
+   the column to the map (align-self: flex-start) leaves the sticky element
+   nothing to travel within, so it scrolls away exactly as if sticky were
+   never set — measured, the map ran to -1212px. The column stretches to
+   the analysis beside it, and the map slides inside that height. */
+/* !important is load-bearing here, not decoration: st.columns writes
+   `align-self: flex-start` as an INLINE style (its default vertical
+   alignment), and an inline declaration beats any stylesheet rule without
+   it. Measured before the override: the column shrink-wrapped to the map's
+   640px inside a 2032px row, so the sticky element had zero travel and
+   scrolled away to -1212px. */
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:has(.st-key-sticky_map) {
+  align-self: stretch !important;
+}
+[data-testid="stHorizontalBlock"] > [data-testid="stColumn"]:has(.st-key-sticky_map)
+  > [data-testid="stVerticalBlock"] {
+  height: 100%;
+}
+/* The sticky element itself must keep its NATURAL height (the map's 640px)
+   — stretching it to the column's full height would leave it nothing to
+   travel within, which is the same failure as shrink-wrapping the column,
+   just from the other direction. */
+.st-key-sticky_map {
+  align-self: flex-start !important;
+  /* flex-grow 0 as well: as the only child of a now-full-height wrapper it
+     would otherwise stretch to 2032px and the map inside it would scroll
+     out of the top of a container that itself never moves. */
+  flex: 0 0 auto !important;
+  height: auto !important;
+}
+/* ...but its CONTAINING BLOCK must be tall, and Streamlit inserts a layout
+   wrapper between the column and the container. Measured: that wrapper sat
+   at 640px around a 640px child, so the sticky element had a zero-height
+   track and never moved, however tall the column was. A sticky element can
+   only travel within its own containing block. */
+[data-testid="stLayoutWrapper"]:has(> .st-key-sticky_map) {
+  height: 100%;
+  align-self: stretch !important;
+}
+@media (max-width: 900px) {
+  /* Narrow: stack, and let the map scroll away normally. Two tiny columns
+     would be worse than one readable one. */
+  .st-key-sticky_map { position: static; }
+}
+
+/* ==== v8.2: removable plan chips ====================================
+   The chips are real buttons (an <a> inside st.markdown cannot call
+   Python), styled back into chips so the row still reads as a summary of
+   the plan rather than a toolbar.
+
+   SELECTOR NOTE: these target `button` directly, NOT `.stButton > button`.
+   Passing help= to st.button wraps it in a [data-testid="stTooltipHoverTarget"],
+   so the button is no longer a direct child of .stButton and every rule
+   written that way silently matched nothing — the chips inherited the
+   global row height and rendered 58px tall. */
+.jx-plan-label {
+  font-family: "DM Mono", SFMono-Regular, monospace;
+  font-size: 10.5px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--text-muted); margin: 2px 0 6px 0;
+}
+.st-key-plan_chip_row [data-testid="stHorizontalBlock"] { gap: 8px; }
+.st-key-plan_chip_row [data-testid="stColumn"],
+.st-key-plan_chip_row [data-testid="stTooltipHoverTarget"],
+.st-key-plan_chip_row .stButton {
+  height: 32px !important;
+  min-height: 32px !important;
+  align-self: flex-start !important;
+}
+.st-key-plan_chip_row button {
+  min-height: 32px !important;
+  height: 32px !important;
+  padding: 0 12px !important;
+  border-radius: 999px !important;
+  background: transparent !important;
+  border: 1px solid var(--border) !important;
+  color: var(--text-secondary) !important;
+  font-size: 12.5px !important;
+  font-weight: 500 !important;
+  white-space: nowrap !important;
+  width: 100% !important;
+}
+.st-key-plan_chip_row button * { white-space: nowrap !important; }
+.st-key-plan_chip_row button:hover {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+  background: var(--accent-soft) !important;
+}
+/* The × is part of the label, so the whole chip is the hit area — a 32px
+   pill is a comfortable target without a giant close icon. */
+.st-key-plan_chip_row .chip-static {
+  display: inline-flex; align-items: center; height: 32px;
+  padding: 0 12px; border-radius: 999px;
+  border: 1px dashed var(--border); color: var(--text-muted);
+  font-size: 12.5px;
 }

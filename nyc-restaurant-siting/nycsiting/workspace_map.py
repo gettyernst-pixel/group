@@ -9,6 +9,7 @@ always drawn hollow/dim so absent evidence can never read as a bad area.
 """
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import numpy as np
@@ -414,6 +415,35 @@ def _marker_trace(fig: go.Figure, frame: pd.DataFrame, tier: str,
 #: vocabularies for the same thing.
 TIER_LABELS = {"closest": "Exact concept", "similar": "Same cuisine",
                "other": "Other restaurant", "site": "Selected site"}
+
+
+def add_radius_ring(fig: go.Figure, lat: float, lon: float,
+                    radius_m: float, points: int = 72) -> go.Figure:
+    """
+    The search radius, drawn as one thin ring.
+
+    Says which restaurants the map is and is not showing, so an empty patch
+    beyond the edge reads as "outside the search" rather than "no
+    restaurants there". Deliberately quiet — a hairline and a barely-there
+    fill — because the district boundary and the markers are the content;
+    this is a scale reference. One 72-point trace, so it costs a couple of
+    kilobytes and cannot compete with the marker layers for attention.
+    """
+    if not radius_m:
+        return fig
+    # metres -> degrees, with longitude corrected for latitude
+    dlat = radius_m / 111_320.0
+    dlon = radius_m / (111_320.0 * max(math.cos(math.radians(lat)), 1e-6))
+    angles = np.linspace(0, 2 * np.pi, points)
+    lats = [round(lat + dlat * math.sin(a), 5) for a in angles]
+    lons = [round(lon + dlon * math.cos(a), 5) for a in angles]
+    fig.add_trace(go.Scattermapbox(
+        lat=lats, lon=lons, mode="lines", fill="toself",
+        fillcolor="rgba(101,227,176,0.05)",
+        line=dict(width=1, color="rgba(101,227,176,0.45)"),
+        name=f"{radius_m:,.0f}m search radius", showlegend=True,
+        hoverinfo="skip"))
+    return fig
 
 
 def add_restaurant_markers(fig: go.Figure, similar: pd.DataFrame,

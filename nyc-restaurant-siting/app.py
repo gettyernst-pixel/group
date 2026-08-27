@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 
 import numpy as np
@@ -19,7 +20,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from nycsiting import (acs, analysis, areas, branding, comparison, config,
-                       geometry, plan_parser, workspace_map,
+                       geo, geometry, plan_parser, workspace_map,
                        context, cuisines, financial_simulation as fs,
                        geocode, google_places, mapview,
                        narrative, nta, pedestrian_dot, report_pdf,
@@ -858,40 +859,53 @@ def landing_page(panel: pd.DataFrame) -> None:
     structured plan; the user confirms it before anything is analysed. Not a
     chat — intelligent search.
     """
-    st.markdown('<div style="height:40px"></div>', unsafe_allow_html=True)
-    st.markdown('<div style="margin-bottom:16px;">'
-                + branding.logo_img(height=50) + '</div>',
-                unsafe_allow_html=True)
-    ui.eyebrow("Restaurant location intelligence")
-    ui.display("Where should your<br>restaurant go?")
-    st.markdown("Tell us what you're planning.")
-    st.markdown('<div style="height:18px"></div>', unsafe_allow_html=True)
+    # Composition: a deliberately narrow column, centred, sitting slightly
+    # above the mathematical centre of the viewport. The old fixed 40px
+    # spacer plus a full-width form left the prompt bar around two-thirds
+    # of the way down an 800px window with dead space above it; the pad is
+    # now viewport-relative (clamp in styles.css) so the hero rises on
+    # short screens instead of pushing the CTA below the fold.
+    st.markdown('<div class="jx-landing-pad"></div>', unsafe_allow_html=True)
+    # A real centred column, not a CSS wrapper: Streamlit widgets cannot be
+    # nested inside a markdown div, so the form would have escaped any
+    # max-width applied that way and kept stretching edge to edge.
+    _, hero, _ = st.columns([1, 3.2, 1])
+    with hero:
+        st.markdown('<div style="margin-bottom:14px;">'
+                    + branding.logo_img(height=44) + '</div>',
+                    unsafe_allow_html=True)
+        ui.eyebrow("Restaurant location intelligence")
+        ui.display("Where should your<br>restaurant go?")
+        st.markdown("Tell us what you're planning.")
+        st.markdown('<div style="height:14px"></div>',
+                    unsafe_allow_html=True)
 
-    # A form, deliberately: clicking the submit button commits the textarea
-    # value in the same run. The previous st.text_area + disabled-button pair
-    # only saw the text after a blur or Cmd+Enter — the reported "Continue
-    # needs Cmd+Enter first" bug.
-    with st.form("plan_form", border=True):
-        text = st.text_area(
-            "Your plan", value=st.session_state.get("plan_text", ""),
-            placeholder=("I want to open an upscale Italian restaurant in "
-                         "10003. About $70 per person and around 60 seats. "
-                         "Good pedestrian activity, not extreme competition."),
-            height=110, label_visibility="collapsed")
-        go = st.form_submit_button("Continue →", type="primary",
-                                   width="stretch")
-    if go and not text.strip():
-        st.caption(":orange[Tell us a little about the restaurant you're "
-                   "planning first.]")
-        go = False
-    st.caption("Try: " + " · ".join(f"*{e}*" for e in EXAMPLE_PLANS))
+        # A form, deliberately: clicking the submit button commits the
+        # textarea value in the same run. The previous st.text_area +
+        # disabled-button pair only saw the text after a blur or Cmd+Enter
+        # — the reported "Continue needs Cmd+Enter first" bug.
+        with st.form("plan_form", border=True):
+            text = st.text_area(
+                "Your plan", value=st.session_state.get("plan_text", ""),
+                placeholder=("I want to open an upscale Italian restaurant "
+                             "in 10003. About $70 per person and around 60 "
+                             "seats. Good pedestrian activity, not extreme "
+                             "competition."),
+                height=110, label_visibility="collapsed")
+            go = st.form_submit_button("Continue →", type="primary",
+                                       width="stretch")
+        if go and not text.strip():
+            st.caption(":orange[Tell us a little about the restaurant "
+                       "you're planning first.]")
+            go = False
+        st.caption("Try: " + " · ".join(f"*{e}*" for e in EXAMPLE_PLANS))
 
     if go:
         # A new plan invalidates everything downstream of the old one —
         # including any cuisine, filter, or comparison the last plan left.
         for key in ("plan_outcome", "plan_confirmed", "sim_results",
                     "sim_location_id", "address", "cuisine", "ws_concept",
-                    "ws_comp", "_comp_mirror", "comparison_area_ids",
+                    "ws_comp", "_comp_mirror", COMPARISON_KEY,
                     "report_pdf", "confirmed_plan", "selected_area",
                     "selected_restaurant", "requested_area"):
             st.session_state.pop(key, None)
@@ -903,11 +917,9 @@ def landing_page(panel: pd.DataFrame) -> None:
         st.session_state["stage"] = "confirm"
         st.rerun()
 
-    saved = st.session_state.get("saved", [])
-    if saved:
-        st.divider()
-        ui.eyebrow("Analyzed locations")
-        st.dataframe(pd.DataFrame(saved), width="stretch", hide_index=True)
+    # The legacy "saved locations" table is gone with the second comparison
+    # store it belonged to. Comparison lives in the workspace tray now, and
+    # the landing page is for authoring a plan — nothing else.
 
 
 def _an(word: str) -> str:
@@ -1121,51 +1133,49 @@ def panel_for_compare():
     return load_panel()
 
 
+def _compare_another(site: dict) -> None:
+    """
+    Put THIS location into the comparison and hand the map back.
+
+    Stays inside the workspace. The previous version appended to a separate
+    `saved` list and then set stage="landing", which dropped the user back
+    at the opening prompt — a plan-authoring screen — merely because they
+    wanted a second location. The prompt exists to start a NEW PLAN; it is
+    not a location picker.
+
+    The add's verdict is KEPT and shown. Discarding it made the primary
+    call to action a silent no-op whenever the add was refused — a full
+    tray, or an address whose neighbourhood is already queued — and then
+    navigated to the map as though it had worked.
+    """
+    added, message = add_to_comparison(make_site_entry(site))
+    st.session_state["_cmp_flash_subject_site"] = (added, message)
+    if added:
+        st.session_state["workspace_view"] = "explore"
+
+
+def _change_concept() -> None:
+    """The concept control lives in the workspace toolbar, so this just
+    puts the user in front of it. It does NOT reset the plan — New Search
+    is the only action that does that."""
+    st.session_state["workspace_view"] = "explore"
+
+
 def render_next(site: dict, cuisine: str, fit: int | None,
                 verdicts: list[dict], landscape) -> None:
-    """Step 12: keep the decision moving — or go deeper on this address."""
+    """Step 12: keep the decision moving, without leaving the workspace."""
     st.markdown("### What next?")
-    if simulation_enabled() and st.button(
-            "Simulate opening here →", type="primary", width="stretch"):
-        # The simulation belongs to THIS address and concept; stamp the pair
-        # so stale results can never render for a different query.
-        st.session_state["sim_location_id"] = (site["label"], cuisine)
-        st.session_state.pop("sim_results", None)
-        st.session_state["stage"] = "simulate"
-        st.rerun()
-    st.caption(
-        "A scenario-based financial model of opening at this address — every "
-        "assumption visible and editable. Estimates, not forecasts.")
-
-    st.markdown("#### Compare this against somewhere else")
-    row = narrative.comparison_row(site["label"], cuisine, fit, verdicts, landscape)
-    area_ctx = site_area_context(panel_for_compare(), site, cuisine, landscape)
-    if area_ctx.get("nta_code"):
-        row["Area"] = area_ctx["nta_name"]
-        row["Competitor density"] = area_ctx["saturation"]["band"] or "—"
-        row["Opportunity gap"] = area_ctx["gap"]["band"]
-    saved = st.session_state.setdefault("saved", [])
-    already = any(r["Location"] == row["Location"] and r["Concept"] == row["Concept"]
-                  for r in saved)
-
-    a, b, c = st.columns([1.2, 1.2, 1])
-    if a.button("Save & compare another location", type="primary",
-                width="stretch", disabled=already):
-        saved.append(row)
-        st.session_state.update(stage="landing")
-        st.rerun()
-    if b.button("Change concept", width="stretch"):
-        st.session_state.update(stage="landing")
-        st.rerun()
-    if saved and c.button("Clear saved", width="stretch"):
-        st.session_state["saved"] = []
-        st.rerun()
-    if already:
-        a.caption("Already saved.")
-
-    if saved:
-        st.markdown("**Saved locations**")
-        st.dataframe(pd.DataFrame(saved), width="stretch", hide_index=True)
+    st.caption("Compare this location against another area or site.")
+    # Both labels are short enough to stay on one line at desktop widths, so
+    # neither button grows taller than the one beside it.
+    left, right = ui.button_row(2)
+    with left:
+        st.button("Compare another location", type="primary",
+                  width="stretch", key="next_compare",
+                  on_click=_compare_another, args=(site,))
+    with right:
+        st.button("Change concept", width="stretch", key="next_concept",
+                  on_click=_change_concept)
 
 
 def render_trace(site, key, report, result, landscape, ped, lot) -> None:
@@ -1908,6 +1918,49 @@ FILTER_HELP = ("Exact concept uses the most specific match supported by the "
                "landscape.")
 
 
+#: Where the map's explanatory lines are parked for this run.
+FILTER_EXPLANATION_KEY = "_filter_explanation"
+
+
+def record_filter_explanation(mode: str, cuisine: str | None,
+                              concept: str | None, tiers: dict,
+                              radius_m: int | None = None) -> None:
+    """
+    Keep the map's explanations, stop printing them above the map.
+
+    Three captions used to stack between the toolbar and the map — what the
+    current filter shows, the exact-concept caveat, and the reconciliation
+    between the map's tiers and the competition read. Each is worth saying;
+    none is worth a paragraph in the one place the map should start. They
+    are collected here and rendered inside the analysis pane instead, where
+    the numbers they explain actually appear.
+    """
+    lines = [filter_caption(mode, cuisine, concept,
+                            limited=bool(tiers.get("unidentifiable")))
+             + (f" Within {radius_m}m of this address." if radius_m else "")]
+    if tiers.get("note"):
+        lines.append(tiers["note"])
+    comparable = len(tiers.get("closest", [])) + len(tiers.get("similar", []))
+    if cuisine and comparable:
+        lines.append(
+            f"Exact concept ({len(tiers['closest'])}) and same cuisine "
+            f"({len(tiers['similar'])}) together are the {comparable} "
+            f"comparable competitors the competition read uses; “other” "
+            f"restaurants are counted in the {tiers['total']} total, not as "
+            f"competitors.")
+    st.session_state[FILTER_EXPLANATION_KEY] = lines
+
+
+def render_filter_explanation() -> None:
+    """The map's explanations, inside the analysis pane and collapsed."""
+    lines = st.session_state.get(FILTER_EXPLANATION_KEY)
+    if not lines:
+        return
+    with st.expander("What the map is showing"):
+        for line in lines:
+            st.caption(line)
+
+
 def filter_caption(mode: str, cuisine: str | None, concept: str | None,
                    limited: bool) -> str:
     """One line saying exactly what the selected tier is showing."""
@@ -2006,8 +2059,29 @@ def polygon_bounds(code: str) -> tuple[float, float, float, float]:
 #: the content width in Explore and ~44% in Assess, and the figure height is
 #: fixed at 640 (workspace_map._base_layout). A fit needs BOTH: a zoom level
 #: is meaningless without the viewport it has to fill.
-MAP_PANE_PX = {"explore": (920, 640), "assess": (615, 640),
-               "compare": (615, 640)}
+#:
+#: MEASURED, not estimated, and measured at the NARROWEST desktop window the
+#: product targets (1280px). The previous values — 920 and 615 — were about
+#: 14% wider than the panes actually are there (806 and 532 measured in the
+#: browser), so a fit computed to fill 71% of an imagined pane overflowed a
+#: real one: an East Village site showed only two of the district's four
+#: bbox corners. Assuming the narrow case is the safe direction, because a
+#: wider window then simply leaves more margin around the same content,
+#: whereas assuming a wide one crops the content on every smaller screen.
+#:
+#: RE-MEASURED after v8.2. The sticky two-pane layout narrowed both columns,
+#: so 806/532 became stale by 10.3% and 4.9% — a fit aiming for 71% of the
+#: pane actually filled 78% in Explore, pushing a district's boundary toward
+#: the edge the padding exists to keep clear. Live values at 1280px, taken
+#: three times per view and identical each time: Explore 731, Assess 507.
+#: A platform with classic (non-overlay) scrollbars loses a further ~15px,
+#: which is ~1% here and well inside the padding, so it is not subtracted.
+#:
+#: "compare" never reaches a fit — render_compare_view returns before the
+#: map is built — so its entry exists only to keep the fit test's sweep over
+#: every declared view total. It is deliberately left at the Assess pane.
+MAP_PANE_PX = {"explore": (731, 640), "assess": (507, 640),
+               "compare": (507, 640)}
 
 #: Padding factor: the binding axis lands at ~1/1.4 = 71% of the pane, so
 #: the whole district shows with visible surrounding geography on every
@@ -2051,6 +2125,90 @@ def zoom_for_bounds(bounds, viewport_px: int = 820,
     return center, float(np.clip(min(zoom_w, zoom_h), 9.5, 16.0))
 
 
+def request_loading(message: str) -> None:
+    """
+    Declare that the run about to happen will do real work.
+
+    THE ONE WAY a loading state is raised. The action that causes the work
+    names it; main() paints the overlay before any of that work starts and
+    takes it down when the page is complete. Nothing else in the app decides
+    when a loader appears, so two loaders can never race and a loader can
+    never be left behind by a code path that forgot to close it.
+
+    Deliberately NOT called for cheap interactions — opening Method,
+    switching a tab, removing a comparison entry, flipping a cached
+    restaurant filter. A loader on work that finishes in 100ms is a flash,
+    not feedback.
+    """
+    st.session_state[branding.LOADING_KEY] = message
+
+
+#: The closest a SITE view is ever framed, and how much room it leaves
+#: around the district that contains it. A site used to be pinned at a flat
+#: 13.6 regardless of where it was, which works for a compact neighbourhood
+#: and fails badly for a large one: the containing district fell entirely
+#: outside the frame, so the map answered "what is near this address?"
+#: while losing "which neighbourhood is this?" — the context the site
+#: analysis is read against.
+SITE_MAX_ZOOM = 13.6
+#: The search radius gets this much room around it, so the ring is never
+#: flush with the pane edge and the markers just outside it still read as
+#: "outside the search" rather than "off the map".
+SITE_RADIUS_HEADROOM = 1.35
+#: And the nearest district edge gets this much, so the boundary lands
+#: inside the frame rather than exactly on it.
+SITE_EDGE_HEADROOM = 1.25
+
+
+def site_zoom(site: dict, radius_m: int | None = None) -> float:
+    """
+    Frame a site so BOTH things a site map is for are visible: the whole
+    search radius the competitors are drawn from, and the nearest edge of
+    the district containing the address.
+
+    Two rejected rules, and why:
+
+    * The district's OWN fit (zoom_for_bounds on its bbox) answers "at what
+      zoom does this polygon fit when centred on ITS centre". A site map is
+      centred on the ADDRESS, so for an address near an edge most of the
+      district still fell outside the frame.
+    * Mirroring the district's bbox around the site fixes that, but at the
+      cost that matters most: an address at the edge of a large district
+      forces a view wide enough to reach the far side, which shrinks the
+      competitor dots — the actual subject — to specks.
+
+    So the rule is the union of the two things that must be on screen. The
+    radius is the analytical scope of every marker, and the nearest
+    boundary is enough to answer "which neighbourhood is this?" — the whole
+    district is not required for that, and demanding it would trade away
+    the competitive detail the view exists to show.
+    """
+    lat, lon = site["lat"], site["lon"]
+    pane_w, pane_h = MAP_PANE_PX.get(
+        st.session_state.get("workspace_view", "assess"), (820, 640))
+    radius_m = int(radius_m or st.session_state.get(
+        "ws_radius", st.session_state.get("_radius_mirror",
+                                          config.DEFAULT_RADIUS_M)))
+    # the search radius, in degrees, with room to breathe around it
+    half_lat = (radius_m / 111_320.0) * SITE_RADIUS_HEADROOM
+    half_lon = half_lat / max(math.cos(math.radians(lat)), 1e-6)
+
+    code = nta_index().locate(lat, lon)
+    if code is not None:
+        x0, y0, x1, y1 = nta_index().features[code]["bbox"]
+        # distance to the NEAREST edge on each axis, so at least one piece
+        # of boundary is in frame wherever inside the district the site is
+        near_lon = min(abs(lon - x0), abs(x1 - lon)) * SITE_EDGE_HEADROOM
+        near_lat = min(abs(lat - y0), abs(y1 - lat)) * SITE_EDGE_HEADROOM
+        half_lon = max(half_lon, near_lon)
+        half_lat = max(half_lat, near_lat)
+
+    _, fit = zoom_for_bounds((lat - half_lat, lat + half_lat,
+                              lon - half_lon, lon + half_lon),
+                             viewport_px=pane_w, viewport_h_px=pane_h)
+    return float(min(SITE_MAX_ZOOM, fit))
+
+
 def select_area(code: str, source: str = "unknown") -> None:
     """
     THE one area-selection handler. Every route — polygon click, Top-match
@@ -2072,7 +2230,25 @@ def select_area(code: str, source: str = "unknown") -> None:
     st.session_state["area_fit_token"] = (
         st.session_state.get("area_fit_token", 0) + 1)
     st.session_state["area_fit_source"] = source
+    # IS THIS AREA THE SUBJECT, OR JUST CONTEXT?
+    # Every route here sets `selected_area`, but they do not all mean the
+    # same thing. Clicking a polygon, searching a neighbourhood or picking
+    # a top match means "analyse THIS area". "Back to explore" means "put
+    # my site's neighbourhood on the map, my site analysis is one click
+    # away" — the site is still the subject.
+    #
+    # Without the distinction the workspace contradicted itself: after
+    # Back-to-explore, `workspace_mode` stays "site", so clicking Gramercy
+    # showed "### Gramercy" in the panel while the add control still
+    # offered the ADDRESS, and "Open full analysis →" on Gramercy opened
+    # the site analysis. Mode alone cannot express this, because the site
+    # must survive an excursion to another area.
+    st.session_state[AREA_IS_SUBJECT] = source != "back_to_explore"
     st.session_state.pop("selected_restaurant", None)
+    # An outstanding "which one?" from an ambiguous search is now answered,
+    # whichever route answered it.
+    st.session_state.pop("_ws_search_choices", None)
+    request_loading(f"Analyzing {nta_names().get(code, code)}…")
 
 
 @st.cache_data(show_spinner=False)
@@ -2087,9 +2263,59 @@ def area_tiers_cached(_panel, code: str, cuisine: str | None,
 
 def area_restaurant_tiers(panel, code: str, cuisine: str | None,
                           concept: str | None = None) -> dict:
+    """CURRENT establishments inside one NTA, tiered. Geography only — the
+    tiering itself is restaurant_tiers()."""
+    merged = panel_with_nta_cached(panel)
+    inside = merged[(merged["nta_2020"] == code) & merged["seen_2026"]
+                    & merged["lat"].notna()]
+    return restaurant_tiers(inside, cuisine, concept)
+
+
+@st.cache_data(show_spinner=False)
+def site_tiers_cached(_panel, lat: float, lon: float, radius_m: int,
+                      cuisine: str | None, concept: str | None) -> dict:
     """
-    CURRENT establishments inside one NTA, split into three honesty-graded
-    tiers — one marker per CAMIS, never inspection rows:
+    The SAME tiers, for the restaurants within `radius_m` of an address.
+
+    Cached on the coordinate/radius/concept tuple, so flipping the
+    Exact-concept / Same-cuisine / All-restaurants filter re-slices an
+    already-computed result instead of recomputing anything — the contract
+    area mode has had since V6.
+    """
+    return site_restaurant_tiers(_panel, lat, lon, radius_m, cuisine,
+                                 concept)
+
+
+def site_restaurant_tiers(panel, lat: float, lon: float, radius_m: int,
+                          cuisine: str | None,
+                          concept: str | None = None) -> dict:
+    """
+    CURRENT establishments within `radius_m` of a site, tiered IDENTICALLY
+    to an area.
+
+    Geography is the ONLY difference from area_restaurant_tiers: the
+    candidate set is a radius around a point rather than an NTA polygon.
+    Everything downstream — which cuisines count as the competitive set,
+    how a named concept is matched, when the exact tier is unmeasurable —
+    is the one shared implementation, so a restaurant can never qualify in
+    one mode and not the other.
+
+    geo.within_radius bounding-boxes before any trigonometry, which keeps
+    this off the critical path with 48k establishments in the frame.
+    """
+    current = panel[panel["seen_2026"] & panel["lat"].notna()]
+    near = geo.within_radius(current, lat, lon, radius_m)
+    return restaurant_tiers(near, cuisine, concept)
+
+
+def restaurant_tiers(inside, cuisine: str | None,
+                     concept: str | None = None) -> dict:
+    """
+    THE tiering, shared by area mode and site mode.
+
+    Splits an already-selected set of CURRENT establishments into three
+    honesty-graded tiers — one marker per CAMIS, never inspection rows,
+    because the panel is one row per establishment:
 
     closest — the highest specificity CURRENT data supports: the exact
         DOHMH cuisine label, narrowed to name-announced concept matches
@@ -2097,11 +2323,11 @@ def area_restaurant_tiers(panel, code: str, cuisine: str | None,
         actually identify. When they can't, `note` says so — never a fake
         exact match.
     similar — the concept's competitive set (the V5/V6 similar tier).
-    other — everything else in the area.
+    other — everything else in scope.
+
+    Callers supply the geography and nothing else; the honesty rules live
+    here so the two modes cannot drift apart.
     """
-    merged = panel_with_nta_cached(panel)
-    inside = merged[(merged["nta_2020"] == code) & merged["seen_2026"]
-                    & merged["lat"].notna()]
     token = concept_token(concept)
     note = None
     #: True when current records cannot identify the concept AT ALL, so the
@@ -2205,21 +2431,35 @@ def _apply_map_selection(event, panel) -> None:
                 st.rerun()
 
 
-def render_map_workspace(panel, site, cuisine: str, landscape,
-                         report, mode: str = "site",
-                         top_matches: list | None = None) -> None:
-    """The persistent map: toolbar, one layer figure, selection handling.
-    Concept changes are synced in main() BEFORE analysis runs, so a change
-    here costs one rerun, not two. Every keyed control is mirrored into a
-    plain session key: Streamlit drops keyed-widget state for widgets that
-    skip a run (e.g. while the Method view is open), and the mirror re-seeds
-    them so layer/filter selections survive any navigation."""
+def render_workspace_toolbar(panel, cuisine: str | None,
+                             mode: str = "site") -> tuple[str, str]:
+    """
+    The control row: Concept, Layer, Restaurants, and Radius in site mode.
+
+    RENDERED AT FULL CONTENT WIDTH, above the map/analysis panes rather
+    than inside the map column. It used to live in the map column, which is
+    ~532px on a 1280px window — not enough for four controls, so Streamlit's
+    column wrapper wrapped them: Concept ended up on a different row from
+    Layer, and the three Restaurants options stacked into a 132px tower
+    beside two 68px dropdowns. Widening the columns could not fix that
+    because the container itself was too narrow. Full width gives the row
+    ~1200px, which fits every control on one line with room to spare.
+
+    Every keyed control is mirrored into a plain session key: Streamlit
+    drops keyed-widget state for widgets that skip a run (e.g. while the
+    Method view is open), and the mirror re-seeds them so layer/filter
+    selections survive any navigation.
+
+    Returns (layer_label, comp_mode) for the map to render from.
+    """
     # Restaurants gets the widest share: its three labels are words, not
     # abbreviations, and they must sit on ONE row at desktop widths.
+    st.markdown('<div class="jx-toolbar"></div>', unsafe_allow_html=True)
     if mode == "site":
-        top1, top2, top3, top4 = st.columns([1.0, 1.15, 1.75, 0.8])
+        top1, top2, top3, top4 = st.columns([1.0, 1.15, 2.1, 1.15],
+                                            gap="small")
     else:
-        top1, top2, top3 = st.columns([1.0, 1.2, 1.9])
+        top1, top2, top3 = st.columns([1.0, 1.2, 2.1], gap="small")
         top4 = None
     with top1:
         options = [CUISINE_ANY] + cuisine_options(panel)
@@ -2273,7 +2513,16 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
             st.slider("Radius (m)", 200, 1500, key="ws_radius", step=50)
             st.session_state["_radius_mirror"] = \
                 st.session_state["ws_radius"]
+    return layer_label, comp_mode
 
+
+def render_map_workspace(panel, site, cuisine: str, landscape,
+                         report, mode: str = "site",
+                         top_matches: list | None = None,
+                         layer_label: str = "", comp_mode: str = "") -> None:
+    """The persistent map: one layer figure and selection handling. The
+    controls are rendered above by render_workspace_toolbar, which hands
+    this the layer and filter to draw."""
     layer = LAYER_CHOICES[layer_label]
     # The published (URL-referenced) geometry, so the shapes are fetched once
     # per browser rather than re-sent with every figure.
@@ -2297,7 +2546,7 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
         view_key = (f"area:{selected_area}:"
                     f"{st.session_state.get('area_fit_token', 0)}")
     elif site is not None:
-        center, zoom = (site["lat"], site["lon"]), 13.6
+        center, zoom = (site["lat"], site["lon"]), site_zoom(site)
         view_key = f"site:{site['label']}"
     else:
         center, zoom = (40.72, -73.97), 9.9
@@ -2311,9 +2560,86 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
     # thematic fill under them so points stay readable (spec section 32).
     fig = _layer_figure(panel, layer, cuisine, geojson, hover, center, zoom,
                         site, report,
-                        fill_scale=0.5 if selected_area else 1.0)
+                        # Mute the thematic fill wherever restaurant markers
+                        # are drawn — in SITE mode too, now that a site
+                        # shows its local competitors. Points on a
+                        # full-strength choropleth are hard to read, and
+                        # the markers are the subject of both views.
+                        fill_scale=0.5 if (selected_area or site is not None)
+                        else 1.0)
     fig.update_layout(uirevision=view_key,
                       mapbox_uirevision=view_key)
+
+    # --- containing district, in SITE mode ---------------------------------
+    # A site analysis is read against its neighbourhood, so the map has to
+    # show which neighbourhood that is. Without this the site marker floated
+    # on an unlabelled thematic wash: the address was visible, the district
+    # it belongs to was not. Drawn only when no area is separately selected,
+    # so the two emphases can never compete for the same outline.
+    if site is not None and not selected_area:
+        # --- local competitive environment ---------------------------------
+        # A site map that shows only its own marker answers "where is this
+        # address?" and nothing else. The question a site analysis exists
+        # to answer is "how crowded is it HERE", so the same restaurant
+        # tiers area mode draws are drawn around the address, using the
+        # SAME shared tiering and the SAME three-way filter — only the
+        # geography differs (a radius instead of a polygon).
+        plan = st.session_state.get("confirmed_plan")
+        radius_m = int(st.session_state.get(
+            "ws_radius", st.session_state.get("_radius_mirror",
+                                              config.DEFAULT_RADIUS_M)))
+        site_tiers = site_tiers_cached(panel, site["lat"], site["lon"],
+                                       radius_m, cuisine,
+                                       plan.concept if plan else None)
+        # The ring first, so every marker draws on top of it.
+        workspace_map.add_radius_ring(fig, site["lat"], site["lon"],
+                                      radius_m)
+        show_other = (comp_mode == ALL_RESTAURANTS
+                      or (comp_mode == EXACT
+                          and site_tiers["unidentifiable"]))
+        workspace_map.add_restaurant_markers(
+            fig,
+            site_tiers["similar"] if comp_mode in (SAME_CUISINE,
+                                                   ALL_RESTAURANTS)
+            else site_tiers["similar"].iloc[0:0],
+            site_tiers["other"], show_other=show_other,
+            closest=site_tiers["closest"])
+        # NOTHING is printed above the map. The filter caption, the
+        # exact-concept caveat and the count reconciliation used to stack
+        # here as three paragraphs between the controls and the map, which
+        # pushed the map down the page and made the workspace read like a
+        # document. All three are still available — as the Restaurants
+        # tooltip and inside the analysis — but the space between the
+        # toolbar and the map is now the map's.
+        record_filter_explanation(comp_mode, cuisine,
+                                  plan.concept if plan else None,
+                                  site_tiers, radius_m=radius_m)
+
+        containing = nta_index().locate(site["lat"], site["lon"])
+        cfeat = nta_index().features.get(containing) if containing else None
+        if cfeat:
+            for i, poly in enumerate(cfeat["polygons"]):
+                # SIMPLIFIED rings, like every other polygon on this map.
+                # feature["polygons"] holds the original float64 geometry
+                # kept for point-in-polygon; drawing from it shipped ~18
+                # characters per coordinate and pushed the site figure from
+                # 34KB to 128-156KB per rerun, undoing the payload work the
+                # published geometry exists to do. Display only — the
+                # analytic rings are untouched.
+                ring = geometry.simplify_ring(poly[0])
+                lons = [round(pt[0], geometry.DISPLAY_DECIMALS)
+                        for pt in ring] + [round(ring[0][0],
+                                                 geometry.DISPLAY_DECIMALS)]
+                lats = [round(pt[1], geometry.DISPLAY_DECIMALS)
+                        for pt in ring] + [round(ring[0][1],
+                                                 geometry.DISPLAY_DECIMALS)]
+                fig.add_trace(go.Scattermapbox(
+                    lat=lats, lon=lons, mode="lines",
+                    line=dict(width=workspace_map.SELECTED_LINE_WIDTH,
+                              color=workspace_map.TOKENS["accent"]),
+                    name=cfeat["name"], legendgroup="containing_district",
+                    showlegend=(i == 0),
+                    hovertemplate=f"{cfeat['name']}<extra></extra>"))
 
     # --- selection emphasis -------------------------------------------------
     if selected_area:
@@ -2340,19 +2666,17 @@ def render_map_workspace(panel, site, cuisine: str, landscape,
             else tiers["similar"].iloc[0:0],
             tiers["other"], show_other=show_other,
             closest=tiers["closest"])
-        st.caption(filter_caption(
-            comp_mode, cuisine, plan.concept if plan else None,
-            limited=bool(tiers["unidentifiable"])))
-        if tiers["note"]:
-            # Shown in every mode: the caveat describes the tier itself,
-            # not the current filter, and hiding it in the default mode
-            # left the exact-concept tier looking like a verified match.
-            st.caption(tiers["note"])
+        # Same as site mode: no paragraphs between the toolbar and the map.
+        # The caveat still travels with the analysis and the tooltip — the
+        # exact-concept tier must never look like a verified match — it
+        # just no longer sits on top of the map.
+        record_filter_explanation(comp_mode, cuisine,
+                                  plan.concept if plan else None, tiers)
 
     # Areas queued for comparison get numbered amber outlines — visually
     # obvious, thematic fill intact, never overpowering restaurant markers.
     for rank, ccode in enumerate(
-            st.session_state.get("comparison_area_ids", []), 1):
+            comparison_area_codes(), 1):
         cset = nta_index().features.get(ccode)
         if not cset:
             continue
@@ -2496,7 +2820,14 @@ def site_area_context(panel, site: dict, cuisine: str, landscape) -> dict:
     code = nta_index().locate(site["lat"], site["lon"])
     if code is None:
         return {"nta_code": None}
-    fit = concept_fit_cached(panel, cuisine)
+    # SAME source the area page uses, including the no-cuisine case. With no
+    # cuisine, concept_fit_cached returns the empty table by design, so
+    # reading it here would tell a plan with no cuisine that the area has
+    # "not enough comparable history" while the area page one click away
+    # shows that area a real concept-independent persistence index. Two
+    # screens of the same product must not disagree about the same area.
+    fit = (concept_fit_cached(panel, cuisine) if cuisine
+           else conceptfree_fit_cached(panel))
     dens = density_cached(panel, cuisine)
     strong = (landscape.strong if landscape is not None
               and getattr(landscape, "ok", False) else None)
@@ -2508,8 +2839,19 @@ def site_area_context(panel, site: dict, cuisine: str, landscape) -> dict:
     fit_band = (fit.loc[code, "band"] if code in fit.index
                 else "Limited evidence")
     gap = areas.opportunity_gap(fit_band, saturation["band"])
+    # The AREA's own relative index, carried alongside its band so SITE mode
+    # can show the neighbourhood read at the same resolution as the area
+    # page does. Deliberately a separate number from the site fit — never
+    # blended with it (see render_area_context).
+    raw_index = fit.loc[code, "fit_index"] if code in fit.index else None
+    fit_index = (None if raw_index is None or pd.isna(raw_index)
+                 else float(raw_index))
+    evidence = evidence_cached(panel)
+    ev_band = (evidence.loc[code, "band"] if code in evidence.index else None)
     return {"nta_code": code, "nta_name": nta_names().get(code, code),
-            "fit_band": fit_band, "saturation": saturation, "gap": gap}
+            "fit_band": fit_band, "fit_index": fit_index,
+            "evidence_band": ev_band,
+            "saturation": saturation, "gap": gap}
 
 
 # ------------------------------------------------------- plan-driven display
@@ -2542,43 +2884,149 @@ PLAN_FIELD_USAGE = {
 _LEVEL_WORD = {"low": "Low", "moderate": "Moderate", "high": "High"}
 
 
+#: The plan fields a chip can clear, and the fields each one owns. The
+#: LOCATION chip is special: whichever location field is actually driving
+#: the analysis is the one it removes, and removing it clears the derived
+#: site state too (see remove_plan_constraint).
+PLAN_LOCATION_FIELDS = ("address", "zipcode", "neighborhood", "borough")
+
+
 def plan_chip_values(plan, area_name: str | None = None,
-                     site_label: str | None = None) -> list[str]:
-    """Compact YOUR PLAN chips — only values the user explicitly provided,
-    never hidden defaults."""
+                     site_label: str | None = None) -> list[dict]:
+    """
+    Compact YOUR PLAN chips — only values the user explicitly provided,
+    never hidden defaults.
+
+    Each chip carries the plan FIELD it stands for, so removing it clears
+    exactly that constraint and nothing else. Chips without a field (the
+    "not specified" placeholder) are informational and carry no ×, because
+    there is nothing to remove.
+    """
     if plan is None:
         return []
-    chips = []
+    chips: list[dict] = []
+
+    def add(label, field=None):
+        chips.append({"label": label, "field": field})
+
     if plan.cuisine:
-        chips.append(plan.cuisine)
+        add(plan.cuisine, "cuisine")
     if plan.concept:
-        chips.append(plan.concept.title() if plan.concept.islower()
-                     else plan.concept)
+        add(plan.concept.title() if plan.concept.islower() else plan.concept,
+            "concept")
     if not plan.cuisine:
-        chips.append("Cuisine · Not specified")
+        add("Cuisine · Not specified")          # nothing to remove
     place = site_label or area_name or plan.zipcode or plan.borough
     if place:
-        chips.append(place)
+        add(place, "location")
     if plan.average_spend:
-        chips.append(f"~${plan.average_spend:.0f}/person")
+        add(f"~${plan.average_spend:.0f}/person", "average_spend")
     if plan.seats:
-        chips.append(f"{plan.seats} seats")
+        add(f"{plan.seats} seats", "seats")
     if plan.price_positioning:
-        chips.append(plan.price_positioning)
+        add(plan.price_positioning, "price_positioning")
     if plan.foot_traffic_preference:
-        chips.append(f"{_LEVEL_WORD[plan.foot_traffic_preference]} foot "
-                     f"traffic")
+        add(f"{_LEVEL_WORD[plan.foot_traffic_preference]} foot traffic",
+            "foot_traffic_preference")
     if plan.competition_tolerance:
-        chips.append("Prefer lower competition"
-                     if plan.competition_tolerance == "low" else
-                     f"{_LEVEL_WORD[plan.competition_tolerance]} competition "
-                     f"tolerance")
+        add("Prefer lower competition"
+            if plan.competition_tolerance == "low" else
+            f"{_LEVEL_WORD[plan.competition_tolerance]} competition "
+            f"tolerance", "competition_tolerance")
     if plan.income_preference:
-        chips.append(f"{_LEVEL_WORD[plan.income_preference]}-income area")
+        add(f"{_LEVEL_WORD[plan.income_preference]}-income area",
+            "income_preference")
     if plan.restaurant_density_preference:
-        chips.append(f"{_LEVEL_WORD[plan.restaurant_density_preference]} "
-                     f"restaurant density")
-    return chips[:7]
+        add(f"{_LEVEL_WORD[plan.restaurant_density_preference]} restaurant "
+            f"density", "restaurant_density_preference")
+    return chips[:8]
+
+
+def plan_chip_labels(plan, area_name: str | None = None,
+                     site_label: str | None = None) -> list[str]:
+    """Just the text of each chip, for callers that render or export the
+    plan rather than edit it (the PDF, any plain summary)."""
+    return [c["label"] for c in plan_chip_values(plan, area_name, site_label)]
+
+
+def remove_plan_constraint(field: str) -> None:
+    """
+    THE one way a plan constraint is cleared.
+
+    Clears exactly the requested structured field, drops only the state
+    genuinely derived from it, and re-runs the SAME deterministic routing
+    the confirm page uses. Claude is never called: the plan is already
+    parsed, and editing it is an edit, not a re-parse.
+
+    Removing the location is the case that matters. It must not feel like
+    New Search — the cuisine, the concept and every preference survive —
+    and it must not send the user back to the prompt. With no location the
+    product already has a defined answer: deterministic DISCOVERY over the
+    remaining plan, which is where this routes.
+
+    Saved comparison entries are deliberately untouched. They are a
+    separate, explicit collection; editing the plan in front of you is not
+    a reason to silently discard locations you already chose to compare.
+    """
+    plan = st.session_state.get("confirmed_plan")
+    if plan is None:
+        return
+
+    if field == "location":
+        # Clear every location field plus the state derived from an
+        # address; provenance is not tracked separately, so the chip
+        # represents whichever location was driving the analysis.
+        plan = plan.copy(update={f: None for f in PLAN_LOCATION_FIELDS})
+        for key in ("address", "selected_area", "selected_restaurant",
+                    "requested_area", "discovery_borough", "area_fit_token",
+                    "area_fit_source", AREA_IS_SUBJECT):
+            st.session_state.pop(key, None)
+        request_loading("Finding the best areas…")
+    else:
+        plan = plan.copy(update={field: None})
+        if field == "cuisine":
+            # The concept survives; the workspace concept selector must
+            # follow the plan rather than re-seeding the alphabetically
+            # first cuisine, which is how "Afghan" used to reappear.
+            st.session_state["cuisine"] = None
+            st.session_state["ws_concept"] = CUISINE_ANY
+            for key in ("ws_comp", "_comp_mirror", "sim_results",
+                        "report_pdf"):
+                st.session_state.pop(key, None)
+
+    st.session_state["confirmed_plan"] = plan
+    route_plan(plan)
+
+
+def route_plan(plan) -> None:
+    """
+    The deterministic routing rules, applied to an already-parsed plan.
+
+    address -> SITE · ZIP/neighbourhood -> AREA · borough -> DISCOVERY in
+    that borough · nothing -> DISCOVERY. Identical in spirit to the confirm
+    page's routing, reachable without going anywhere near the prompt.
+    """
+    if plan.address:
+        st.session_state["workspace_mode"] = "site"
+        st.session_state["address"] = plan.address
+        st.session_state["workspace_view"] = "assess"
+        return
+    st.session_state.pop("address", None)
+
+    codes = []
+    if plan.zipcode or plan.neighborhood:
+        codes = resolve_area_candidates(plan.neighborhood or plan.zipcode,
+                                        plan.borough)
+    if len(codes) == 1:
+        st.session_state["workspace_mode"] = "area"
+        select_area(codes[0], source="plan_edit")
+        st.session_state["workspace_view"] = "assess"
+        return
+
+    st.session_state["workspace_mode"] = "discovery"
+    st.session_state["discovery_borough"] = plan.borough
+    st.session_state["workspace_view"] = "assess"
+    st.session_state.pop("selected_area", None)
 
 
 def _tercile_band(percentile: float | None) -> str | None:
@@ -2980,7 +3428,8 @@ def build_comparison_payload(bundles: list[dict],
     return comparison.ComparisonReportPayload(
         concept_line=" ".join(concept_bits).title() if concept_bits else
         "General restaurant concept",
-        plan_items=plan_chip_values(plan) if plan else [],
+        # Labels only: the report describes the plan, it does not edit it.
+        plan_items=plan_chip_labels(plan) if plan else [],
         generated=datetime.date.today().isoformat(),
         areas=area_reports, leaders=leaders,
         recommendation=recommendation, methodology=methodology,
@@ -2996,68 +3445,379 @@ def narrative_cached(payload_json: str, key_present: bool,
     return report_writer.narrate(payload, _api_key)
 
 
-def _remove_compare_area(code: str) -> None:
-    ids = st.session_state.get("comparison_area_ids", [])
-    st.session_state["comparison_area_ids"] = [c for c in ids if c != code]
-    st.session_state.pop("report_pdf", None)
+# ======================================================= comparison state
+#: THE canonical comparison store. One list, one shape, one set of
+#: mutators.
+#:
+#: WHY THIS REPLACED comparison_area_ids: the previous design kept a bare
+#: list of NTA codes, and an "Add to comparison" button existed only inside
+#: render_area_explorer — so the action was present in AREA mode and simply
+#: absent in SITE mode. From the user's side that reads as "Add to
+#: comparison only works sometimes". Meanwhile a SECOND, unrelated store
+#: (st.session_state["saved"]) sat behind "Save & compare another location"
+#: in render_next_steps and pushed stage="landing", which is why a
+#: comparison action could throw the user back to the opening prompt.
+#: Both are gone: one store, reachable from every mode, and nothing in the
+#: comparison path touches `stage`.
+COMPARISON_KEY = "comparison_locations"
+
+#: Set by select_area: True when the area was explicitly chosen, False when
+#: it is only the spatial context for a site (see select_area).
+AREA_IS_SUBJECT = "_area_is_subject"
+
+#: What the comparison ENGINE consumes is an area bundle, so a site is
+#: compared through the area that contains it. That is stated in the UI
+#: rather than smoothed over: a site entry always shows both its address
+#: and the area standing in for it, and the two scores are never merged.
+COMPARE_KIND_AREA = "area"
+COMPARE_KIND_SITE = "site"
 
 
-def _clear_comparison() -> None:
-    st.session_state["comparison_area_ids"] = []
-    st.session_state.pop("report_pdf", None)
+def comparison_entries() -> list[dict]:
+    """The canonical list. Always a list, never None."""
+    entries = st.session_state.get(COMPARISON_KEY)
+    if not isinstance(entries, list):
+        entries = []
+        st.session_state[COMPARISON_KEY] = entries
+    return entries
+
+
+def comparison_area_codes() -> list[str]:
+    """The areas the engine will actually compare, in selection order."""
+    return [e["area_code"] for e in comparison_entries()][
+        :comparison.MAX_COMPARE_AREAS]
+
+
+def make_area_entry(code: str) -> dict | None:
+    """A neighbourhood, chosen from the map or the area panel."""
+    if code not in nta_index().features:
+        return None
+    return {"kind": COMPARE_KIND_AREA, "id": f"area:{code}",
+            "area_code": code, "display_name": nta_names().get(code, code),
+            "address": None}
+
+
+def make_site_entry(site: dict) -> dict | None:
+    """
+    An exact address. Stored WITH the area that contains it, because that
+    is the unit the comparison engine works in; both are shown.
+    """
+    code = nta_index().locate(site["lat"], site["lon"])
+    if code is None:
+        return None
+    label = site.get("label") or "Selected site"
+    # Identity is the resolved coordinate, not the typed string: "6 E 1st St"
+    # and "6 East 1 Street, New York, NY, USA" are the same place and must
+    # not be addable twice.
+    return {"kind": COMPARE_KIND_SITE,
+            "id": f"site:{site['lat']:.5f},{site['lon']:.5f}",
+            "area_code": code, "display_name": label,
+            "address": label, "area_name": nta_names().get(code, code)}
+
+
+def add_to_comparison(entry: dict | None) -> tuple[bool, str]:
+    """
+    THE one way anything enters the comparison. Atomic and idempotent.
+
+    Validates, de-duplicates, enforces the maximum and commits — all before
+    returning, so the caller never has to trigger a second run for the
+    selection to "take". The old add mutated state and immediately called
+    st.rerun(), which meant the commit and the confirmation lived in
+    different runs; anything that reset state in between (a New Search
+    cleanup, a route change) could silently drop the addition.
+
+    De-duplication is by AREA CODE, not by entry id, because the area is
+    what actually gets compared: adding a site and then the neighbourhood
+    around it would otherwise produce a comparison of an area against
+    itself. Returns (added, message) so the caller can say what happened.
+    """
+    if not entry or not entry.get("area_code"):
+        return False, "That location could not be placed in a neighbourhood."
+    entries = comparison_entries()
+    existing = next((e for e in entries
+                     if e["area_code"] == entry["area_code"]), None)
+    if existing is not None:
+        if existing["id"] == entry["id"]:
+            return False, "Already in the comparison."
+        return False, (f"{existing['display_name']} already covers this "
+                       f"neighbourhood in the comparison.")
+    if len(entries) >= comparison.MAX_COMPARE_AREAS:
+        return False, (f"Maximum {comparison.MAX_COMPARE_AREAS} locations — "
+                       "remove one first.")
+    st.session_state[COMPARISON_KEY] = entries + [entry]
+    invalidate_comparison_report()
+    return True, f"{entry['display_name']} added."
+
+
+def remove_from_comparison(entry_id: str) -> None:
+    st.session_state[COMPARISON_KEY] = [
+        e for e in comparison_entries() if e["id"] != entry_id]
+    invalidate_comparison_report()
+
+
+def clear_comparison() -> None:
+    st.session_state[COMPARISON_KEY] = []
+    invalidate_comparison_report()
     if st.session_state.get("workspace_view") == "compare":
         st.session_state["workspace_view"] = "explore"
 
 
+def invalidate_comparison_report() -> None:
+    """A generated PDF describes one exact selection; change the selection
+    and it must not remain downloadable."""
+    st.session_state.pop("report_pdf", None)
+
+
+def _open_comparison() -> None:
+    st.session_state["workspace_view"] = "compare"
+    request_loading("Preparing comparison…")
+
+
 def render_compare_tray() -> None:
-    """Persistent compact tray — visible whenever areas are queued."""
-    ids = st.session_state.get("comparison_area_ids", [])
-    if not ids:
+    """
+    The persistent tray. Visible in Explore, Assess and Method alike, so a
+    selection made in one view is still visible from the others.
+    """
+    entries = comparison_entries()
+    if not entries:
         return
-    names = nta_names()
+    n, cap = len(entries), comparison.MAX_COMPARE_AREAS
     with st.container(border=True, key="compare_tray"):
-        ui.eyebrow("Compare areas")
-        for i, code in enumerate(ids, 1):
-            row_l, row_r = st.columns([5, 1])
-            row_l.markdown(f"**{i}** &nbsp; {names.get(code, code)}")
-            row_r.button("×", key=f"cmp_rm_{code}",
-                         on_click=_remove_compare_area, args=(code,))
-        left, right = st.columns([1.4, 1])
-        left.caption(f"{len(ids)} / {comparison.MAX_COMPARE_AREAS} selected"
-                     + ("" if len(ids) >= 2 else " — add one more to "
-                                                 "compare"))
-        if len(ids) >= 2:
-            if right.button("Compare →", key="cmp_go", type="primary",
-                            width="stretch"):
-                st.session_state["workspace_view"] = "compare"
-                st.rerun()
-        else:
-            right.button("Compare →", key="cmp_go", disabled=True,
-                         width="stretch")
-        st.button("Clear", key="cmp_clear", on_click=_clear_comparison)
+        ui.eyebrow("Compare")
+        for entry in entries:
+            row_l, row_r = st.columns([6, 1])
+            with row_l:
+                st.markdown(f"**{entry['display_name']}**")
+                if entry["kind"] == COMPARE_KIND_SITE:
+                    # Never let a site silently masquerade as its area.
+                    st.caption(f"Site · compared as "
+                               f"{entry.get('area_name', entry['area_code'])}")
+            row_r.button("×", key=f"cmp_rm_{entry['id']}",
+                         on_click=remove_from_comparison,
+                         args=(entry["id"],),
+                         help=f"Remove {entry['display_name']}")
+        st.caption(f"{n} / {cap} selected"
+                   + ("" if n >= 2 else " — add one more to compare"))
+        left, right = ui.button_row(2)
+        with left:
+            st.button("Compare →", key="cmp_go", type="primary",
+                      width="stretch", disabled=n < 2,
+                      on_click=_open_comparison)
+        with right:
+            st.button("Clear", key="cmp_clear", width="stretch",
+                      on_click=clear_comparison)
 
 
-def render_add_to_comparison(code: str) -> None:
-    """The intentional add action — polygon clicks never auto-add."""
-    ids = st.session_state.get("comparison_area_ids", [])
-    if code in ids:
-        st.button("✓ Added to comparison", key=f"cmp_added_{code}",
+def _submit_workspace_search(text: str) -> None:
+    """
+    Resolve a typed location INSIDE the workspace, keeping the plan.
+
+    Tries the app's own neighbourhood names first, then treats the text as
+    a street address. Either way the concept, the confirmed plan and the
+    comparison tray are untouched — this is a location picker, not a new
+    plan, so Claude is never re-run and nothing downstream is reset.
+    """
+    # Every submission starts from a clean slate: leftover choices or a
+    # leftover error from a PREVIOUS search would otherwise sit under the
+    # box offering stale neighbourhoods to jump to, or scolding the user
+    # about input they have already corrected.
+    st.session_state.pop("_ws_search_choices", None)
+    st.session_state.pop("_ws_search_error", None)
+    query = (text or "").strip()
+    if not query:
+        st.session_state["_ws_search_error"] = "Type an address or a " \
+                                               "neighbourhood first."
+        return
+    plan = st.session_state.get("confirmed_plan")
+    borough = getattr(plan, "borough", None)
+    codes = resolve_area_candidates(query, borough)
+    if len(codes) == 1:
+        st.session_state["workspace_mode"] = "area"
+        st.session_state.pop("address", None)
+        select_area(codes[0], source="workspace_search")
+        st.session_state["workspace_view"] = "assess"
+        return
+    if len(codes) > 1:
+        # Genuinely ambiguous ("Murray Hill" is two neighbourhoods) — offer
+        # the choice rather than guessing one.
+        st.session_state["_ws_search_choices"] = codes[:6]
+        return
+    # Not a neighbourhood we know: treat it as an address.
+    st.session_state["workspace_mode"] = "site"
+    st.session_state["workspace_view"] = "assess"
+    st.session_state["address"] = query
+    st.session_state.pop("selected_area", None)
+    st.session_state.pop("selected_restaurant", None)
+    request_loading("Analyzing your location…")
+
+
+def _pick_search_choice(code: str) -> None:
+    st.session_state["workspace_mode"] = "area"
+    st.session_state.pop("address", None)
+    st.session_state.pop("_ws_search_choices", None)
+    select_area(code, source="workspace_search")
+    st.session_state["workspace_view"] = "assess"
+
+
+def render_workspace_search() -> None:
+    """
+    Search another location WITHOUT leaving the workspace.
+
+    The opening prompt authors a PLAN; using it to pick a second location
+    threw away the plan and the comparison with it. This is the location
+    picker that belongs beside the map: same concept, new place.
+    """
+    with st.container(border=True, key="ws_search"):
+        ui.eyebrow("Search another location")
+        with st.form("ws_search_form", border=False,
+                     clear_on_submit=False):
+            text = st.text_input(
+                "Address or neighbourhood", key="ws_search_text",
+                label_visibility="collapsed",
+                placeholder="Address or neighbourhood — e.g. Gramercy")
+            st.form_submit_button(
+                "Analyze location →", width="stretch",
+                on_click=lambda: _submit_workspace_search(
+                    st.session_state.get("ws_search_text", "")))
+        # Popped, not read: this is a flash about the submission that just
+        # happened. Leaving it in state meant the hint reappeared every
+        # time the user came back to this view, scolding them about input
+        # they had corrected — or abandoned — several screens ago.
+        error = st.session_state.pop("_ws_search_error", None)
+        if error:
+            st.caption(f":orange[{error}]")
+        choices = st.session_state.get("_ws_search_choices")
+        if choices:
+            st.caption("Which one?")
+            names = nta_names()
+            for code in choices:
+                st.button(names.get(code, code), key=f"ws_pick_{code}",
+                          width="stretch", on_click=_pick_search_choice,
+                          args=(code,))
+        concept = st.session_state.get("cuisine")
+        st.caption(f"Keeps your current concept"
+                   + (f" — {concept}." if concept else "."))
+
+
+def _abandon_address() -> None:
+    """Drop the unresolvable address and put the workspace back on the map,
+    keeping the plan, the concept and the comparison."""
+    st.session_state.pop("address", None)
+    st.session_state["workspace_mode"] = "area"
+    st.session_state["workspace_view"] = "explore"
+
+
+def render_address_failure(message: str, address: str) -> None:
+    """
+    An address that will not resolve must not strand the user.
+
+    The workspace search can send any typed string down the site path — one
+    transposed letter is enough. Before, the only way out was a button that
+    set stage="landing", which threw away the plan, the concept and the
+    whole comparison to recover from a typo. Both exits now stay inside the
+    workspace; New Search remains available in the header for anyone who
+    actually does want to start over.
+    """
+    st.error(message)
+    st.caption(f"Searched for: {address}")
+    left, right = ui.button_row(2)
+    with left:
+        st.button("Back to the map", key="addr_fail_back", width="stretch",
+                  type="primary", on_click=_abandon_address)
+    with right:
+        st.button("Search another location", key="addr_fail_search",
+                  width="stretch", on_click=_abandon_address)
+    render_workspace_search()
+
+
+def area_is_subject(selected_area: str | None, view: str) -> bool:
+    """
+    Is the selected area what the workspace is ABOUT, or just context?
+
+    THE ONE rule, used by both the panel and the add control so the two can
+    never disagree about what the user is looking at. An area is the
+    subject when it was explicitly chosen (see select_area), and always in
+    Explore, where the map — and therefore the area under it — is the view.
+    """
+    if not selected_area:
+        return False
+    return view == "explore" or bool(st.session_state.get(AREA_IS_SUBJECT))
+
+
+def current_comparison_subject(site: dict | None, mode: str,
+                               selected_area: str | None,
+                               view: str) -> tuple[dict | None, str]:
+    """
+    What the workspace is analysing right now, as a comparison entry.
+
+    Uses the SAME rule as the panel, because the add control has to offer
+    whatever the panel is actually showing. Getting this wrong is worse
+    than having no button: it put the user's address into the comparison
+    while they were looking at a neighbourhood, and then — because the
+    store dedupes by area — refused every area they clicked afterwards,
+    leaving the comparison permanently stuck at one entry.
+
+    Returns (entry, key_suffix) so the caller renders one stable widget.
+    """
+    if area_is_subject(selected_area, view):
+        return make_area_entry(selected_area), "subject_area"
+    if mode == "site" and site is not None:
+        return make_site_entry(site), "subject_site"
+    if selected_area:
+        return make_area_entry(selected_area), "subject_area"
+    return None, "subject_none"
+
+
+def _handle_add(entry: dict | None, flash_key: str) -> None:
+    """on_click handler: commit, then leave a message for this run to show.
+    Runs BEFORE the script body, so the tray and the button both render
+    from already-committed state in the very next paint — one run, no
+    second rerun, nothing left half-applied."""
+    added, message = add_to_comparison(entry)
+    st.session_state[flash_key] = (added, message)
+
+
+def render_add_to_comparison(entry: dict | None,
+                             key_suffix: str) -> None:
+    """
+    The intentional add action, offered identically for an area and for a
+    site. Map clicks never auto-add — selecting is not choosing.
+    """
+    if entry is None:
+        return
+    entries = comparison_entries()
+    flash_key = f"_cmp_flash_{key_suffix}"
+    already = any(e["id"] == entry["id"] for e in entries)
+    covered = next((e for e in entries
+                    if e["area_code"] == entry["area_code"]
+                    and e["id"] != entry["id"]), None)
+    full = len(entries) >= comparison.MAX_COMPARE_AREAS
+
+    if already:
+        st.button("✓ Added to comparison", key=f"cmp_added_{key_suffix}",
                   disabled=True, width="stretch")
-    elif len(ids) >= comparison.MAX_COMPARE_AREAS:
-        st.button("Comparison full — maximum 3 areas",
-                  key=f"cmp_full_{code}", disabled=True, width="stretch")
+    elif covered is not None:
+        st.button(f"✓ {covered['display_name']} already added",
+                  key=f"cmp_cov_{key_suffix}", disabled=True,
+                  width="stretch")
+    elif full:
+        st.button(f"Comparison full — maximum "
+                  f"{comparison.MAX_COMPARE_AREAS}",
+                  key=f"cmp_full_{key_suffix}", disabled=True,
+                  width="stretch")
     else:
-        if st.button("+ Add to comparison", key=f"cmp_add_{code}",
-                     width="stretch"):
-            st.session_state["comparison_area_ids"] = ids + [code]
-            st.session_state.pop("report_pdf", None)
-            st.rerun()
+        st.button("+ Add to comparison", key=f"cmp_add_{key_suffix}",
+                  width="stretch", on_click=_handle_add,
+                  args=(entry, flash_key))
+    flash = st.session_state.pop(flash_key, None)
+    if flash and not flash[0]:
+        st.caption(f":orange[{flash[1]}]")
 
 
 def render_compare_view(panel, cuisine: str | None, plan) -> None:
     """AREA COMPARISON — 2–3 areas against the SAME plan, same dark shell."""
-    ids = st.session_state.get("comparison_area_ids", [])[
-        :comparison.MAX_COMPARE_AREAS]
+    entries = comparison_entries()[:comparison.MAX_COMPARE_AREAS]
+    ids = [e["area_code"] for e in entries]
     names = nta_names()
     bundles = [area_bundle_cached(panel, code, cuisine,
                                   plan.concept if plan else None)
@@ -3072,6 +3832,16 @@ def render_compare_view(panel, cuisine: str | None, plan) -> None:
         if concept_bits:
             st.caption(f"{concept_bits.title()} — every area compared "
                        f"against the same plan.")
+        # An address the user queued must not quietly become its
+        # neighbourhood. The comparison engine works in AREAS, so a site is
+        # compared through the area containing it — which is legitimate,
+        # but only while it is said out loud. Without this the heading read
+        # "East Village vs Gramercy" for a user who had queued a specific
+        # street address, and nothing on the page connected the two.
+        sites = [e for e in entries if e["kind"] == COMPARE_KIND_SITE]
+        for entry in sites:
+            st.caption(f"Site: **{entry['display_name']}** — compared using "
+                       f"its area, {entry.get('area_name', entry['area_code'])}.")
     with top_r:
         if st.button("← Back to map", key="cmp_back", width="stretch"):
             st.session_state["workspace_view"] = "explore"
@@ -3148,33 +3918,87 @@ def render_compare_view(panel, cuisine: str | None, plan) -> None:
                     st.caption(f"{r.category}: {r.why} (evidence: "
                                f"{r.evidence})")
 
-    # ----- PDF export -------------------------------------------------------
+    # ----- report export ----------------------------------------------------
     st.divider()
     export_l, export_r = st.columns([2.2, 1])
     with export_r:
-        if st.button("Export report ↓", key="cmp_export", width="stretch"):
-            with st.spinner("Generating report…"):
-                payload = build_comparison_payload(bundles, plan)
-                key = get_anthropic_api_key()
-                narrative_dict = narrative_cached(payload.json(), bool(key),
-                                                  key)
-                pdf = report_pdf.render_pdf(payload, narrative_dict)
-                st.session_state["report_pdf"] = (
-                    report_pdf.report_filename(payload), pdf,
-                    narrative_dict is not None)
-        stored = st.session_state.get("report_pdf")
-        if stored:
-            filename, pdf_bytes, used_llm = stored
-            st.download_button("Download PDF report ↓", data=pdf_bytes,
-                               file_name=filename, mime="application/pdf",
-                               type="primary", width="stretch",
-                               key="cmp_download")
-            if not used_llm:
-                st.caption("Narrative written from deterministic templates "
-                           "(language model unavailable) — all analytics "
-                           "identical.")
+        render_report_control(bundles, plan, cuisine)
     with export_l:
         st.caption(comparison.LIMITATION)
+
+
+@st.cache_resource(show_spinner=False)
+def data_version() -> str:
+    """Identity of the built data, so a cached report cannot outlive a
+    rebuild of the panel it was written from."""
+    return str(int(config.RESTAURANTS_PQ.stat().st_mtime))
+
+
+def report_signature(bundles: list[dict], cuisine: str | None, plan) -> tuple:
+    """
+    What a generated report is FOR. If any of this changes, the stored PDF
+    describes a comparison the user is no longer looking at, and must not
+    stay downloadable.
+    """
+    return (tuple(b["code"] for b in bundles), cuisine,
+            getattr(plan, "concept", None), data_version())
+
+
+def _request_report() -> None:
+    """Raise the loader and defer the build to the next run, so the PDF is
+    built with the overlay already covering the screen rather than after
+    it."""
+    st.session_state["_build_report"] = True
+    request_loading("Creating your report…")
+
+
+def render_report_control(bundles: list[dict], plan,
+                          cuisine: str | None) -> None:
+    """
+    ONE report control, in one place.
+
+    Streamlit cannot start a download from a callback — the bytes must
+    exist before st.download_button renders — so one click genuinely
+    cannot both build and deliver a PDF. What it can do is never show two
+    controls at once: before the PDF exists this slot is an Export button;
+    the moment it exists, the same slot is the Download button. The user
+    experiences one control that changes state, not a two-step form with
+    both halves on screen.
+
+    The PDF is keyed to the exact comparison it describes, so reopening the
+    view or switching tabs never rebuilds it, and changing the selection,
+    the concept or the underlying data discards it rather than offering a
+    report that contradicts the screen.
+    """
+    signature = report_signature(bundles, cuisine, plan)
+    stored = st.session_state.get("report_pdf")
+    if stored and stored[0] != signature:
+        stored = None
+        st.session_state.pop("report_pdf", None)
+
+    # Deferred build: the overlay raised by _request_report is up right now.
+    if stored is None and st.session_state.pop("_build_report", False):
+        payload = build_comparison_payload(bundles, plan)
+        key = get_anthropic_api_key()
+        narrative_dict = narrative_cached(payload.json(), bool(key), key)
+        pdf = report_pdf.render_pdf(payload, narrative_dict)
+        stored = (signature, report_pdf.report_filename(payload), pdf,
+                  narrative_dict is not None)
+        st.session_state["report_pdf"] = stored
+
+    if stored is None:
+        st.button("Export comparison report ↓", key="cmp_export",
+                  type="primary", width="stretch", on_click=_request_report)
+        return
+
+    _, filename, pdf_bytes, used_llm = stored
+    st.download_button("Download comparison report ↓", data=pdf_bytes,
+                       file_name=filename, mime="application/pdf",
+                       type="primary", width="stretch", key="cmp_download")
+    if not used_llm:
+        st.caption("Narrative written from deterministic templates "
+                   "(language model unavailable) — all analytics "
+                   "identical.")
 
 
 # ---------------------------------------------------------------- confirm
@@ -3390,6 +4214,7 @@ def confirm_page(panel) -> None:
         st.session_state["confirmed_plan"] = edited
         st.session_state["workspace_view"] = "assess"
         st.session_state["stage"] = "results"
+        request_loading("Analyzing your plan…")
         st.rerun()
 
 
@@ -3530,6 +4355,72 @@ def render_method_page(status: list[tuple[str, bool]] | None = None) -> None:
 
 
 # ---------------------------------------------------------------- panels
+def _view_containing_area(code: str) -> None:
+    """Site → area, keeping the plan and the concept exactly as they are.
+
+    Nothing is re-parsed and nothing is re-geocoded: this only moves the
+    canonical selection and the view, so the same concept is carried
+    straight into the area analysis.
+    """
+    select_area(code, source="site_area_context")
+    st.session_state["workspace_mode"] = "area"
+    st.session_state["workspace_view"] = "assess"
+    st.session_state.pop("address", None)
+
+
+def render_area_context(site: dict, cuisine: str | None,
+                        area_ctx: dict) -> None:
+    """
+    LEVEL 2 of a site analysis: the neighbourhood the address sits in.
+
+    A site score answers "how does this address look?". On its own it
+    leaves the user without the other half of the question — "and what
+    kind of area is it in?". This block supplies that, as a SEPARATE
+    reading with its own number, its own band and its own evidence grade.
+
+    The two indices are never combined. A site fit of 49 and an area fit of
+    68 are answers to different questions on different evidence; averaging
+    them, or presenting either as a probability, would invent a quantity
+    neither one supports.
+    """
+    code = area_ctx.get("nta_code")
+    if not code:
+        st.caption("This address could not be placed inside a mapped "
+                   "neighbourhood, so no area context is available.")
+        return
+    with st.container(border=True, key="site_area_context"):
+        ui.eyebrow("Area context")
+        st.markdown(f"**{area_ctx['nta_name']}**")
+        index = area_ctx.get("fit_index")
+        band = area_ctx.get("fit_band") or "Limited evidence"
+        if index is None:
+            # No fabricated midpoint: the area simply has too little
+            # comparable history for this concept, and says so.
+            st.markdown(
+                f"<span style='font-size:15px;color:var(--text-secondary);"
+                f"font-weight:600;'>{band}</span>", unsafe_allow_html=True)
+            st.caption("Not enough comparable history in this area to place "
+                       "a relative concept fit — not a negative signal.")
+        else:
+            st.markdown(
+                f"<span style='font-size:26px;font-weight:600;'>"
+                f"{index:.0f}</span>"
+                f"<span style='font-size:14px;color:var(--text-muted);'>"
+                f" / 100</span>  <span style='font-size:14px;"
+                f"color:var(--text-secondary);font-weight:600;'>{band}"
+                f"</span>", unsafe_allow_html=True)
+            st.caption(
+                (f"Area concept fit · {cuisine} · Evidence: "
+                 f"{area_ctx.get('evidence_band') or '—'}" if cuisine else
+                 "Area restaurant persistence (all concepts) · "
+                 f"Evidence: {area_ctx.get('evidence_band') or '—'}"))
+        st.caption("Separate from the site fit above — the two measure "
+                   "different things and are never combined.")
+        st.button("View full area analysis →", key="site_view_area",
+                  width="stretch", on_click=_view_containing_area,
+                  args=(code,))
+
+
 def render_site_panel(panel, site, cuisine, price, report, result, landscape,
                       verdicts, fit, band, headline, quality, area_ctx,
                       lot, ped) -> None:
@@ -3544,33 +4435,31 @@ def render_site_panel(panel, site, cuisine, price, report, result, landscape,
         st.rerun()
     ui.eyebrow(f"{cuisine or 'Restaurant'} · Site analysis")
     st.markdown(f"#### {site['label']}")
-    a, b = st.columns([1.2, 1])
-    with a:
-        st.markdown(
-            f'<span style="font-size:34px;font-weight:600;">'
-            f'{fit if fit is not None else "–"}</span>'
-            f'<span style="font-size:16px;color:var(--text-muted);"> / 100'
-            f'</span>  <span style="font-size:15px;color:var(--text-secondary);'
-            f'font-weight:600;">{band}</span>', unsafe_allow_html=True)
-        st.markdown(f"<span style='font-size:12.5px;color:var(--text-muted);'>"
-                    f"Location fit · relative index · Evidence quality: "
-                    f"{quality[0] if quality else '—'}</span>",
-                    unsafe_allow_html=True)
-        with st.expander("What does this mean?"):
-            st.caption(
-                "A relative location-fit index combining the evidence "
-                "available for this site, for comparing locations. It is "
-                "not a probability of restaurant success.")
-    with b:
-        if simulation_enabled():
-            if st.button("Simulate →", type="primary", width="stretch"):
-                st.session_state["sim_location_id"] = (site["label"], cuisine)
-                st.session_state.pop("sim_results", None)
-                st.session_state["stage"] = "simulate"
-                st.rerun()
+    # Full width, not a 1.2/1 split. The right-hand cell existed to hold
+    # the Simulate button and later the add-to-comparison control; both
+    # have moved, and a column kept for a control that is no longer there
+    # is just dead space beside the headline number.
+    st.markdown(
+        f'<span style="font-size:34px;font-weight:600;">'
+        f'{fit if fit is not None else "–"}</span>'
+        f'<span style="font-size:16px;color:var(--text-muted);"> / 100'
+        f'</span>  <span style="font-size:15px;color:var(--text-secondary);'
+        f'font-weight:600;">{band}</span>', unsafe_allow_html=True)
+    st.markdown(f"<span style='font-size:12.5px;color:var(--text-muted);'>"
+                f"Location fit · relative index · Evidence quality: "
+                f"{quality[0] if quality else '—'}</span>",
+                unsafe_allow_html=True)
+    with st.expander("What does this mean?"):
+        st.caption(
+            "A relative location-fit index combining the evidence "
+            "available for this site, for comparing locations. It is "
+            "not a probability of restaurant success.")
     st.markdown(headline)
     if site.get("warning"):
         st.warning(f"**Check the address.** {site['warning']}")
+
+    # LEVEL 2: the neighbourhood containing this address, as its own read.
+    render_area_context(site, cuisine, area_ctx)
 
     tab_overview, tab_comp, tab_market, tab_history, tab_property = st.tabs(
         ["Overview", "Competition", "Market", "History", "Property"])
@@ -3679,6 +4568,7 @@ def render_analyze_site_cta(code: str) -> None:
                                 workspace_view="assess")
         st.session_state.pop("selected_area", None)
         st.session_state.pop("selected_restaurant", None)
+        request_loading("Analyzing your location…")
         st.rerun()
     elif go:
         st.caption(":orange[Type the street address first.]")
@@ -3740,7 +4630,9 @@ def render_area_explorer(panel, code: str, cuisine: str,
                 f"Evidence: {ev_band}"))
 
     render_analyze_site_cta(code)
-    render_add_to_comparison(code)
+    # The add-to-comparison control is rendered once by the workspace
+    # shell, so it exists in every mode rather than only where an area
+    # panel happens to be the active branch.
 
     if compact:
         ui.stat_strip([
@@ -3870,7 +4762,7 @@ def _reset_search() -> None:
     for k in ("selected_area", "selected_restaurant", "workspace_mode",
               "discovery_borough", "requested_area", "workspace_view",
               "cuisine", "ws_concept", "ws_comp", "_comp_mirror",
-              "comparison_area_ids", "report_pdf", "confirmed_plan",
+              COMPARISON_KEY, "report_pdf", "confirmed_plan",
               "plan_confirmed", "price", "plan_text", "plan_outcome",
               "address"):
         st.session_state.pop(k, None)
@@ -3920,7 +4812,7 @@ def render_workspace_nav(view: str) -> None:
     widgets that missed a run. Selection state is untouched: nothing
     re-parses, re-geocodes, or recomputes.
     """
-    has_compare = len(st.session_state.get("comparison_area_ids", [])) >= 2
+    has_compare = len(comparison_entries()) >= 2
     widths = ([0.62, 0.62, 0.62, 0.62, 2.9] if has_compare
               else [0.62, 0.62, 0.62, 3.5])
     cols = st.columns(widths)
@@ -3953,6 +4845,16 @@ def main() -> None:
     # in the whole product.
     ui.inject_styles()
 
+    # THEN the overlay, before a single byte of analysis. An action that is
+    # about to cause real work leaves its message in session state (see
+    # request_loading); painting the overlay here means everything rendered
+    # afterwards is produced behind it, so the user never sees the page
+    # assembling itself. Everything below runs inside this block.
+    with branding.global_loader(st.session_state.get(branding.LOADING_KEY)):
+        _main_body()
+
+
+def _main_body() -> None:
     # Only the panel is needed by every stage. Locations, PLUTO lots and the
     # pedestrian counts feed SITE analysis alone, so they are loaded at the
     # point of use: an area-only session never pays their first-read cost,
@@ -4010,7 +4912,7 @@ def main() -> None:
         plan,
         area_name=nta_names().get(st.session_state.get("selected_area")),
         site_label=address if mode == "site" else None)
-    ui.plan_chips(chips)
+    ui.plan_chips(chips, on_remove=remove_plan_constraint)
 
     if view == "method":
         render_method_page([
@@ -4026,7 +4928,7 @@ def main() -> None:
         return
 
     if view == "compare":
-        if len(st.session_state.get("comparison_area_ids", [])) >= 2:
+        if len(comparison_entries()) >= 2:
             render_compare_view(panel, cuisine, plan)
             return
         st.session_state["workspace_view"] = "explore"
@@ -4047,14 +4949,13 @@ def main() -> None:
         try:
             site = geocode_cached(address)
         except geocode.GeocodeError as exc:
-            st.error(str(exc))
-            if st.button("Try another address"):
-                st.session_state["stage"] = "landing"
-                st.rerun()
+            render_address_failure(str(exc), address)
             return
         # Canonical coordinates: validated once, reused by every module.
         if not (40.4 <= site["lat"] <= 41.0 and -74.3 <= site["lon"] <= -73.6):
-            st.error("That address resolved outside NYC — check the borough.")
+            render_address_failure(
+                "That address resolved outside NYC — check the borough.",
+                address)
             return
         locs = load_locations()
         key = resolve_location_key(locs, site)
@@ -4158,28 +5059,63 @@ def main() -> None:
         top_matches = rows[:3]
 
     # ---------------- workspace ---------------------------------------------
+    # The control row spans the full content width, ABOVE the panes: four
+    # controls do not fit in a 532px map column, and Streamlit wrapped them
+    # into a ragged two-row block when they did not.
+    layer_label, comp_mode = render_workspace_toolbar(panel, cuisine, mode)
+
     # Explore leads with the map; Assess leads with the analysis. Both are
-    # views over the SAME canonical selection state.
+    # views over the SAME canonical selection state, and in both the map
+    # column is STICKY (see .jx-sticky-map in assets/styles.css) so the
+    # geography stays on screen while the analysis beside it scrolls.
     if view == "explore":
-        map_col, panel_col = st.columns([0.66, 0.34], gap="medium")
+        map_col, panel_col = st.columns([0.60, 0.40], gap="medium")
     else:
-        map_col, panel_col = st.columns([0.44, 0.56], gap="medium")
+        map_col, panel_col = st.columns([0.42, 0.58], gap="medium")
     with map_col:
-        render_map_workspace(panel, site, cuisine, landscape, report,
-                             mode=mode, top_matches=top_matches)
+        # The marker class the sticky CSS hooks; Streamlit gives the
+        # container a st-key-* class of its own, which is what makes this
+        # targetable without guessing at emotion hashes.
+        with st.container(key="sticky_map"):
+            render_map_workspace(panel, site, cuisine, landscape, report,
+                                 mode=mode, top_matches=top_matches,
+                                 layer_label=layer_label,
+                                 comp_mode=comp_mode)
 
     with panel_col:
         selected_area = st.session_state.get("selected_area")
         selected_rest = st.session_state.get("selected_restaurant")
+        # The tray first — a selection made anywhere stays visible from
+        # every view — then the in-workspace location picker, so choosing
+        # the next place to compare never needs the opening prompt.
         render_compare_tray()
+        # The map's explanations live here now, beside the numbers they
+        # explain, instead of as paragraphs stacked above the map.
+        render_filter_explanation()
+        render_workspace_search()
+        # ONE add control, rendered from the shell rather than from inside a
+        # panel renderer. The panel below is a mutually-exclusive chain over
+        # (restaurant, view, mode, area), and the add action used to hang
+        # off a single branch of it — so whether the button existed depended
+        # on a four-way combination of state. That is the whole of "Add to
+        # comparison only works sometimes". Deriving the subject here means
+        # whatever the workspace is currently analysing can be compared.
+        render_add_to_comparison(*current_comparison_subject(
+            site, mode, selected_area, view))
 
         if selected_rest:
             render_restaurant_card(panel, selected_rest, landscape, site)
-        elif view == "explore" and selected_area:
-            # In Explore, a selected area is the spatial context — even in
-            # site mode (Back-to-explore lands here); Assess still shows the
-            # full site analysis.
-            render_area_explorer(panel, selected_area, cuisine, compact=True)
+        elif area_is_subject(selected_area, view):
+            # The area the user actually chose wins, in EITHER view — the
+            # same rule the add control uses, so the panel and the button
+            # can never describe different places. Previously this branch
+            # was `view == "explore"` alone, so in Assess an explicitly
+            # clicked neighbourhood fell through to the site branch below
+            # and "Open full analysis →" on Gramercy opened the address.
+            # A site is still reachable: Back-to-explore marks its area as
+            # CONTEXT rather than subject, so the site keeps the panel.
+            render_area_explorer(panel, selected_area, cuisine,
+                                 compact=view == "explore")
         elif mode == "site" and site is not None:
             if view == "explore":
                 ui.eyebrow(f"{cuisine or 'Restaurant'} · Site analysis")
@@ -4253,16 +5189,19 @@ def main() -> None:
         else:
             st.caption("Click an area on the map to explore it.")
 
-    if mode == "site" and site is not None:
-        if st.session_state.get("_dev_trace"):
-            render_trace(site, key, report, result, landscape, ped, lot)
-        if view == "assess":
-            render_methodology(result, radius)
-    else:
-        with st.expander("Data & methodology"):
-            st.caption("Full methodology lives under Method in the top "
-                       "navigation; sources: DOHMH, Google Places, 2024 "
-                       "ACS, PLUTO, NYC DOT, NYC Planning geographies.")
+        # STILL INSIDE panel_col. These were the last sections rendering
+        # below both columns at full width; with a sticky map beside them,
+        # anything outside the right pane leaves the left half blank.
+        if mode == "site" and site is not None:
+            if st.session_state.get("_dev_trace"):
+                render_trace(site, key, report, result, landscape, ped, lot)
+            if view == "assess":
+                render_methodology(result, radius)
+        else:
+            with st.expander("Data & methodology"):
+                st.caption("Full methodology lives under Method in the top "
+                           "navigation; sources: DOHMH, Google Places, 2024 "
+                           "ACS, PLUTO, NYC DOT, NYC Planning geographies.")
 
 
 if __name__ == "__main__":

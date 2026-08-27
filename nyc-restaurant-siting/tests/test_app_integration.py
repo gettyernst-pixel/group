@@ -248,19 +248,30 @@ def test_results_keep_concept_and_location_in_view():
     assert "42 B" in body and "Italian" in body
 
 
-def test_save_and_compare_keeps_the_candidate():
+def test_compare_another_location_keeps_the_user_in_the_workspace():
+    """
+    v8: "Save & compare another location" used to append to a separate
+    `saved` list and then set stage="landing" — so asking to compare threw
+    the user back to the plan-authoring prompt and out of the workspace.
+    The action now commits to the one comparison store and stays put.
+    """
     at = run("42 Broadway, Manhattan", "Italian")
-    save = next(b for b in at.button if "Save & compare" in b.label)
-    at = save.click().run()
-    # Back on the landing page, with the saved row visible.
+    compare = next(b for b in at.button
+                   if "Compare another location" in b.label)
+    at = compare.click().run()
+
+    assert at.session_state["stage"] == "results", \
+        "a comparison action must never return the user to the landing page"
     body = " ".join(m.value for m in at.markdown)
-    assert "Where should your" in body
-    assert "Analyzed locations" in body   # renamed in the refactor
-    saved = at.session_state["saved"]
-    assert len(saved) == 1
-    assert saved[0]["Location"].startswith("42 B")
-    assert saved[0]["Concept"] == "Italian"
-    assert isinstance(saved[0]["Overall fit"], int)
+    assert "Where should your" not in body
+
+    entries = at.session_state["comparison_locations"]
+    assert len(entries) == 1
+    assert entries[0]["kind"] == "site"
+    assert entries[0]["display_name"].startswith("42 B")
+    # A site is compared through the area that contains it, and says so.
+    assert entries[0]["area_code"]
+    assert entries[0]["area_name"]
 
 
 def test_recommendation_synthesises_both_sides():
@@ -279,14 +290,22 @@ def test_methodology_is_present_but_last():
 
 # --- the simulate stage ------------------------------------------------------
 def to_simulate(address="195 Bowery, Manhattan", cuisine="Italian"):
+    """
+    Reach the simulate stage WITHOUT a user-facing entry point.
+
+    v8 removed the last Simulation copy from the product: the "Simulate
+    opening here →" call to action and the caption advertising "a
+    scenario-based financial model" both sat in the site panel's What-next
+    block, and the caption rendered unconditionally — advertising a feature
+    the flag keeps hidden. The engine is still validated here, so the tests
+    enter the stage directly through the developer flag instead of through
+    a control the product no longer offers.
+    """
     at = run(address, cuisine)
-    # Simulation is gated out of the user product; regression tests keep the
-    # validated engine covered through the developer flag.
     at.session_state["_enable_sim"] = True
-    at = at.run()
-    cta = next(b for b in at.button if "Simulate opening here" in b.label
-               or b.label == "Simulate →")
-    return cta.click().run()
+    at.session_state["sim_location_id"] = (address, cuisine)
+    at.session_state["stage"] = "simulate"
+    return at.run()
 
 
 def test_simulate_is_only_reachable_after_an_assessment():
@@ -334,8 +353,13 @@ def test_changing_location_invalidates_simulation_results():
     at = next(b for b in at.button if "Continue" in str(b.label)).click().run()          # -> confirm
     analyze = next(b for b in at.button if "Analyze" in b.label)
     at = analyze.click().run()
-    cta = next(b for b in at.button if "Simulate opening here" in b.label)
-    at = cta.click().run()
+    # Re-enter simulate directly: v8 removed the user-facing entry point,
+    # so the stage is reached the same way to_simulate() reaches it.
+    at.session_state["_enable_sim"] = True
+    at.session_state["sim_location_id"] = ("42 Broadway, Manhattan",
+                                           "Italian")
+    at.session_state["stage"] = "simulate"
+    at = at.run()
     assert not at.exception
     # Old Bowery results must not be shown for Broadway.
     assert st_get(at, "sim_results") is None

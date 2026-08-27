@@ -28,10 +28,31 @@ def inject_styles() -> None:
     st.markdown(f"<style>{_CSS_PATH.read_text()}</style>", unsafe_allow_html=True)
     st.markdown(branding.spinner_css(), unsafe_allow_html=True)
     st.markdown(branding.map_ground_css(), unsafe_allow_html=True)
+    st.markdown(branding.overlay_css(), unsafe_allow_html=True)
 
 
 def esc(value: object) -> str:
     return _html.escape(str(value))
+
+
+# ------------------------------------------------------------ button rows
+def button_row(count: int = 2, gap: str = "small"):
+    """
+    Equal columns for buttons that sit side by side.
+
+    THE ONE PLACE adjacent-button layout is decided. Rows used to be built
+    ad hoc — st.columns([1.2, 1.2, 1]) here, [2.2, 1] there — which left
+    dead space beside short buttons and, worse, gave neighbours different
+    widths: a long label wrapped onto a second line while the button next
+    to it stayed one line, so the two were visibly different heights.
+
+    Equal columns plus width="stretch" on every button in the row means the
+    row always fills its container and every button in it has the same box.
+    Height parity is finished in assets/styles.css, which gives buttons in
+    a horizontal block a shared min-height and centres their labels, so
+    even a label that does wrap cannot make its row ragged.
+    """
+    return st.columns([1] * max(1, count), gap=gap)
 
 
 # ---------------------------------------------------------------- shell
@@ -53,15 +74,66 @@ def section(number: str, title: str, question: str | None = None) -> None:
         st.markdown(f"## {question}")
 
 
-def plan_chips(values: list[str]) -> None:
-    """YOUR PLAN as compact chips — the user's own explicit inputs, visibly
-    still driving the analysis. Never a paragraph, never hidden defaults."""
+def plan_chips(values: list, on_remove=None) -> None:
+    """
+    YOUR PLAN as compact chips — the user's own explicit inputs, visibly
+    still driving the analysis. Never a paragraph, never hidden defaults.
+
+    Chips are REMOVABLE when `on_remove` is given and the chip names a plan
+    field. A constraint you can see but cannot change is just a label; the
+    × makes the plan editable in place, without going back to the prompt.
+
+    Rendered as real Streamlit buttons rather than HTML, because an <a> in
+    st.markdown cannot call Python. The chip appearance is CSS on the
+    button (see .jx-chip-row in assets/styles.css), so it still reads as a
+    chip rather than a row of form controls.
+
+    Accepts the legacy list-of-strings form as well, so any caller that has
+    not been updated still renders (without × controls).
+    """
     if not values:
         return
-    inner = "".join(f'<span class="chip">{esc(v)}</span>' for v in values)
-    st.markdown(
-        f'<div class="jx-plan"><span class="k">Your plan</span>{inner}</div>',
-        unsafe_allow_html=True)
+    chips = [v if isinstance(v, dict) else {"label": v, "field": None}
+             for v in values]
+    removable = [c for c in chips if c["field"] and on_remove]
+
+    if not removable:
+        inner = "".join(f'<span class="chip">{esc(c["label"])}</span>'
+                        for c in chips)
+        st.markdown(
+            f'<div class="jx-plan"><span class="k">Your plan</span>'
+            f'{inner}</div>', unsafe_allow_html=True)
+        return
+
+    st.markdown('<div class="jx-plan-label">Your plan</div>',
+                unsafe_allow_html=True)
+    with st.container(key="plan_chip_row"):
+        # One column per chip, sized to its label, PLUS a trailing spacer
+        # that absorbs the rest of the row. Without the spacer Streamlit
+        # divides the full content width between the chips, so three short
+        # constraints stretched into three 400px slabs instead of reading
+        # as chips.
+        widths = [max(len(c["label"]), 6) + 4 for c in chips]
+        spacer = max(sum(widths) * 1.8, 20)
+        cols = st.columns(widths + [spacer], gap="small")
+        for col, chip in zip(cols, chips):
+            with col:
+                if chip["field"] and on_remove:
+                    # A NON-BREAKING space: with an ordinary one the
+                    # label wrapped onto a second line at narrow column
+                    # widths ("Brunch Spot" measured 58px tall beside 30px
+                    # chips), which is the exact ragged-height problem the
+                    # button system exists to prevent.
+                    st.button(f"{chip['label']}\u00a0 ✕",
+                              key=f"chip_rm_{chip['field']}",
+                              on_click=on_remove, args=(chip["field"],),
+                              help=f"Remove {chip['label']} from your plan",
+                              width="stretch")
+                else:
+                    st.markdown(
+                        f'<span class="chip chip-static">'
+                        f'{esc(chip["label"])}</span>',
+                        unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- context

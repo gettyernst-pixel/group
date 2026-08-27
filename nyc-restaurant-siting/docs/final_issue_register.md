@@ -66,23 +66,44 @@ built. That last check is the one that would have caught this.
 
 ---
 
-## ISSUE-01b · HIGH · OPEN (action required before deploy)
+## ISSUE-01b · HIGH · CLOSED (2026-08-27)
 ### The corrected data reaches production only when committed
 
-`processed/*.parquet` is **tracked in git** (committed as "Add processed
-data for Streamlit deployment"), which is how the deployed app obtains its
-data. The ISSUE-01 rebuild therefore exists only in the working tree:
+`processed/*.parquet` is **tracked in git**, which is how the deployed app
+obtains its data. When this issue was written the ISSUE-01 rebuild existed
+only in the working tree:
 
 ```
  M processed/restaurants.parquet
  M processed/locations.parquet
 ```
 
-Until those are committed and pushed, the deployed app continues to serve
-the panel with the fabricated 0%-survival cuisines. **No commit or push was
-made** — this release's instructions reserve that decision.
+so the deployed app would have kept serving the panel with the fabricated
+0%-survival cuisines until someone committed it.
 
-**Contributing cause, worth fixing separately.** `.gitignore` lists
+**Verified closed by inspection, not by assumption.** This audit re-checked
+the claim rather than repeating it — and it was already stale. The rebuilt
+data was committed as `2fdcd41` ("Final data integrity and performance
+fixes", 2026-08-26 15:56), after the parquet files were written at 14:42.
+`git status processed/` is now empty: the working tree and the commit agree.
+
+The committed panel was then read directly and checked against the figures
+this register pins:
+
+| Check | Committed data | Register |
+|---|---|---|
+| Panel rows | 48,101 | 48,101 |
+| Cohort survival | 9,723 / 26,505 = 36.7% | 9,723 / 26,505 = 36.7% |
+| Bakery Products/Desserts | 333 / 734 | 333 / 734 |
+| Coffee/Tea | 531 / 1,547 | 531 / 1,547 |
+| Pizza | 574 / 1,655 | 574 / 1,655 |
+| Asian/Asian Fusion | 84 / 364 | 84 / 364 |
+| Retired DOHMH labels present | **none** | none expected |
+
+**Nothing blocks release on this item.** No commit or push was made by this
+audit; the commit that closed it predates this pass.
+
+**Contributing cause, still worth fixing separately.** `.gitignore` lists
 `processed/`, but an ignore rule has no effect on files already tracked. The
 repository therefore looks as though its data is not versioned while in fact
 it is, which is very likely why a stale build survived a code fix: someone
@@ -280,17 +301,26 @@ fixed because no user-facing surface reads it.
 
 ---
 
-## ISSUE-12 · LOW · OPEN
-### The restaurant filter wraps to two rows at 1280px
+## ISSUE-12 · LOW · CLOSED (2026-08-27)
+### The restaurant filter wrapped to two rows at 1280px
 
 The three filter segments (Exact concept · Same cuisine · All restaurants)
-sit on one row at 1440px wide but wrap to two at 1280px, which is a common
-laptop width. Observed in the browser at both widths; not caused by this
-release's changes. Not fixed here because the toolbar column ratios were
-tuned deliberately in the previous release and are pinned by a test —
-re-tuning them warrants its own verification pass across widths rather than
-a late adjustment in an integrity release. Purely cosmetic: all three
-options remain visible, labelled and operable.
+sat on one row at 1440px wide but wrapped to two at 1280px, a common laptop
+width. Purely cosmetic — all three options remained visible, labelled and
+operable — and it was left open in the previous pass because re-tuning the
+toolbar column ratios warranted its own verification rather than a late
+adjustment.
+
+**Verified closed by re-measurement, not by assumption.** The v8.2 toolbar
+rework (moving the controls to a full-width row and targeting the real
+`stButtonGroup` testid, with `flex: 1 0 auto; min-width: max-content` on the
+options) resolved it as a side effect. Measured live at 1280px: all three
+options report the same `y` (321) — one row — with widths 202/196/201 and a
+right edge at 1262px against a 1280px viewport, so 18px of margin remains.
+No label is truncated.
+
+This entry is a reminder of the rule this audit ran under: the previous
+report said OPEN, and it was wrong by the time it was read.
 
 ---
 
@@ -306,20 +336,155 @@ options remain visible, labelled and operable.
 
 ---
 
+## ISSUE-13 · MEDIUM · CLOSED (2026-08-27)
+### The competition reference distribution was rebuilt on every score
+
+**What was wrong.** `scoring.competitor_reference` builds the reference
+distribution the competition component is scored against: it samples 1200
+restaurants from the cuisine pool and counts each one's neighbours within
+the radius. It ran in full on **every single score**, costing 1114 ms each
+time — and it is a pure function of `(panel, cuisine_set, radius_m, sample,
+seed)`. It does not depend on the site being scored, and with a fixed seed
+it is deterministic, so every one of those rebuilds produced exactly the
+value the previous one had produced.
+
+**Why it is a bug and not a preference.** This is not "the code could be
+faster". The same inputs were being recomputed to the same output, on the
+user's critical path, for the single most expensive operation in a site
+analysis. Nothing about the result depended on the work being repeated.
+
+**Fix.** Memoised on that exact key, bounded at 64 entries. The subtle part
+is the invalidation: the cache entry stores the panel object alongside the
+result and is only reused when `cached[0] is panel`. A rebuilt panel is a
+new object, so it can never inherit a stale distribution — which is what
+would have turned a performance fix into a data-integrity bug.
+
+**Verified closed.** `tests/test_v9_scoring_reference_memo.py` (5 tests):
+the distribution is identical on a memo hit; a different panel object is
+never served a cached reference; cuisine and radius separate the key; the
+cache is bounded; and an end-to-end site score, band and component
+breakdown are unchanged. `test_scoring.py` and
+`test_validation_scenarios.py` re-run green (37 tests together).
+
+**No scoring output changed.** Caching only.
+
+---
+
+## ISSUE-14 · LOW · CLOSED (2026-08-27)
+### The map-fit pane constants had gone stale, so every area fit over-zoomed
+
+**What was wrong.** `MAP_PANE_PX` tells the fitBounds maths how wide the map
+pane is, and held `explore: 806, assess: 532` — measured in the browser
+before v8.2. The v8.2 sticky two-pane layout narrowed both columns. Measured
+live at a 1280px viewport, three samples per view, identical each time:
+**explore 731, assess 507**. The constants were over by 10.3% and 4.9%.
+
+**Effect.** A fit that aims to put the binding axis at 71% of the pane put
+it at 78% in Explore, so a district's boundary sat closer to the frame edge
+than `AREA_FIT_PADDING` is designed to keep clear. Still inside the stated
+65–80% target, which is why nothing looked obviously broken — but drifting
+in the direction the padding exists to prevent.
+
+**Why no test caught it.** `test_whole_district_fits_with_context_on_every_
+side` feeds `MAP_PANE_PX` into the fit *and* into its own expectation. It is
+self-consistent by construction: it cannot see a pane constant that has
+stopped describing the page. A test that derives its expectation from the
+value under test can only ever confirm arithmetic.
+
+**Fix.** Constants corrected to the measured widths, with the measurement
+and its date recorded in the comment. Added
+`tests/test_v9_map_pane_constants.py` (5 tests) checking what the old test
+cannot: that the declared widths still match the browser measurement, that
+their ratio matches the `st.columns` layout ratio the panes actually come
+from, that both views imply the same underlying row width, that the pane
+height matches the figure height, and that `compare` still renders no map.
+
+**The guard was proven to fail.** Reintroducing 806/532 trips all three
+width assertions with specific messages. A guard that has never been seen to
+fail is not a guard.
+
+**Also documented.** `MAP_PANE_PX["compare"]` never reaches a fit —
+`render_compare_view` returns before the map is built. The entry is kept so
+the fit sweep covers every declared view, and the new test fails if compare
+ever grows a map without its pane being measured for real.
+
+---
+
+## ISSUE-15 · LOW · OPEN (accepted, reported not deleted)
+### Eleven functions have no call site
+
+Measured by running the whole suite under a `sys.setprofile` hook and then
+searching every function the profiler never entered for a call site
+anywhere in the repository. Eleven have exactly one occurrence — their own
+`def` line:
+
+`app.render_competition`, `app._an` (a duplicate of `narrative._an`, which
+is the live one), `app.render_context_bar`, `app.render_hero`,
+`app.panel_for_compare`, `app.neighborhood_to_nta`,
+`locations.occupancy_history`, `workspace_map.add_nta_boundaries`,
+`workspace_map.legend_for`, `ui.decision_hero` (reachable only from dead
+`render_hero`), `ui.query_context` (callers are dead `render_context_bar`
+and the flag-gated `simulate_page`).
+
+**No functional loss.** Each is superseded by the code that replaced it. The
+one worth checking explicitly was `add_nta_boundaries`, since NTA outlines
+are a product requirement: the live thematic choropleth draws its own
+boundaries with the same `BOUNDARY_WIDTH`/`BOUNDARY_LINE` constants, and the
+running figure was confirmed in the browser to carry
+`marker.line = {width: 1.2, color: "rgba(210,225,240,0.45)"}`.
+
+**Not deleted.** Removing dead code is not a bug fix, and this release's
+remit is integrity. Listed here so the next release can remove it
+deliberately.
+
+---
+
+## ISSUE-16 · LOW · OPEN (accepted, no action)
+### The test total is larger than the reachable product
+
+`stage == "simulate"` is set **only by tests**. In production `app.py`
+assigns `stage` exactly three values: `landing`, `confirm`, `results`. This
+is deliberate and documented — `simulation_enabled()` gates the subsystem
+behind a deployer flag (`ENABLE_SIMULATION`, or a session flag the
+regression tests set) and the route guard redirects to `results` when the
+flag is off.
+
+So the financial-simulation subsystem is dark-shipped, not dead and not a
+reintroduced Simulation UI. The only thing worth recording is the reporting
+consequence: 57 tests (`test_financial_simulation.py` 20,
+`test_financial_v2.py` 28, `test_sim_animation.py` 9) plus four cases in
+`test_app_integration.py` exercise code no user reaches in the default
+configuration. The 680-test total should be read with that in mind rather
+than as a measure of the shipped surface.
+
+---
+
 ## Summary
 
 | Severity | Closed | Open |
 |---|---:|---:|
 | CRITICAL | 1 | 0 |
-| HIGH | 0 | 2 |
-| MEDIUM | 5 | 0 |
-| LOW | 2 | 3 |
+| HIGH | 1 | 1 |
+| MEDIUM | 6 | 0 |
+| LOW | 4 | 4 |
 
-**The one action blocking release** is ISSUE-01b: the rebuilt data must be
-committed, or the deployed app keeps serving the fabricated cuisine survival
-rates that ISSUE-01 describes.
+Closed in this pass: ISSUE-01b and ISSUE-12 — both verified by direct
+re-checking, and **both were already stale when read**; plus ISSUE-13 and
+ISSUE-14, found and fixed here. Opened and accepted: ISSUE-15, ISSUE-16.
+
+**Nothing blocks release.** The item that previously did — ISSUE-01b, the
+uncommitted data rebuild — was committed as `2fdcd41` before this pass
+began, and the committed panel was read and matched against every figure
+this register pins. No commit or push was made by this audit.
 
 The single open HIGH (ISSUE-02) is a user-experience defect with a measured
 root cause and a documented fix path; it does not affect any number the
 product reports. No open issue causes the app to state something untrue
 about the data.
+
+**Two integrations could not be verified** because no credentials exist in
+this environment: the Anthropic report narrative and Google Places. Both
+degrade to labelled fallbacks, and the fallbacks are marked PASS separately
+from the primary paths, which remain `NOT VERIFIED — EXTERNAL ACCESS
+REQUIRED`. A working fallback is not evidence that the thing it replaces
+works.

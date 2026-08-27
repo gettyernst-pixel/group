@@ -51,6 +51,12 @@ def _unavailable(key, label, reason):
     return Component(key, label, None, WEIGHTS[key], reason, available=False)
 
 
+#: Memo for competitor_reference. Bounded, and each entry remembers the exact
+#: panel object it was built from.
+_REFERENCE_CACHE: dict = {}
+_REFERENCE_CACHE_MAX = 64
+
+
 def competitor_reference(panel: pd.DataFrame, cuisine_set: set[str],
                          radius_m: float, sample: int = 1200,
                          seed: int = 0) -> np.ndarray:
@@ -62,16 +68,42 @@ def competitor_reference(panel: pd.DataFrame, cuisine_set: set[str],
     reference is instead the places where this concept actually trades. Sampled
     rather than exhaustive because the full comparison is quadratic and this
     runs inside a web app; 1200 points is ample for a percentile.
+
+    MEMOISED, because this distribution describes the CONCEPT, not the site
+    being scored: it depends only on the panel, the competitive set and the
+    radius, and with a fixed seed it is deterministic. Measured before the
+    memo, it ran 1200 radius queries taking ~1.1s on EVERY score — so a
+    radius change cost 1.4s, and comparing three addresses of the same
+    cuisine paid for the identical array three times.
+
+    The entry stores the panel it was built from and is only reused when that
+    is the very same object (`is`), so a rebuilt or reloaded panel can never
+    be served a reference distribution computed from the previous one. The
+    numbers returned are unchanged — this is the same computation, done once.
     """
+    key = (frozenset(cuisine_set), float(radius_m), int(sample), int(seed))
+    cached = _REFERENCE_CACHE.get(key)
+    if cached is not None and cached[0] is panel:
+        return cached[1]
+
     pool = panel[panel["seen_2026"] & panel["cuisine"].isin(cuisine_set)
                  & panel["lat"].notna()]
     if pool.empty:
-        return np.array([])
-    ref = pool.sample(min(sample, len(pool)), random_state=seed)
-    return np.array([
-        len(within_radius(pool, r.lat, r.lon, radius_m)) - 1
-        for r in ref.itertuples()
-    ])
+        result = np.array([])
+    else:
+        ref = pool.sample(min(sample, len(pool)), random_state=seed)
+        result = np.array([
+            len(within_radius(pool, r.lat, r.lon, radius_m)) - 1
+            for r in ref.itertuples()
+        ])
+
+    if len(_REFERENCE_CACHE) >= _REFERENCE_CACHE_MAX:
+        # plain FIFO: every entry costs the same to rebuild, so there is no
+        # value in tracking recency, and an unbounded dict would grow with
+        # every cuisine x radius the session touches.
+        _REFERENCE_CACHE.pop(next(iter(_REFERENCE_CACHE)))
+    _REFERENCE_CACHE[key] = (panel, result)
+    return result
 
 
 def score_site(report: dict, panel: pd.DataFrame, lot: dict | None,

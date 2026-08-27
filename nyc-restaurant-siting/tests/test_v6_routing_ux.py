@@ -535,11 +535,22 @@ def test_your_plan_chips_show_only_explicit_values():
     plan = plan_parser.RestaurantPlan(cuisine="Japanese",
                                       average_spend=60.0,
                                       foot_traffic_preference="high")
+    # v8.2: a chip now carries the plan FIELD it stands for, so it can be
+    # removed individually. plan_chip_labels keeps the plain-text form for
+    # callers that only render the plan (the PDF).
     chips = app_mod.plan_chip_values(plan, area_name="Murray Hill-Kips Bay")
-    assert "Japanese" in chips and "~$60/person" in chips
-    assert "High foot traffic" in chips
-    assert not any("$$" in c for c in chips)        # unstated price absent
+    labels = app_mod.plan_chip_labels(plan, area_name="Murray Hill-Kips Bay")
+    assert "Japanese" in labels and "~$60/person" in labels
+    assert "High foot traffic" in labels
+    assert not any("$$" in c for c in labels)       # unstated price absent
     assert app_mod.plan_chip_values(None) == []
+    assert app_mod.plan_chip_labels(None) == []
+
+    by_label = {c["label"]: c["field"] for c in chips}
+    assert by_label["Japanese"] == "cuisine"
+    assert by_label["Murray Hill-Kips Bay"] == "location"
+    assert by_label["~$60/person"] == "average_spend"
+    assert by_label["High foot traffic"] == "foot_traffic_preference"
 
 
 def test_matches_your_priorities_rendered_for_area():

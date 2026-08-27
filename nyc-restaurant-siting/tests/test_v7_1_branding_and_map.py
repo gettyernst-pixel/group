@@ -331,8 +331,72 @@ def test_site_and_area_use_different_framing():
     street-level view; DISCOVERY stays a city overview."""
     block = APP_SRC.split("if selected_area:")[1].split("st.session_state[")[0]
     assert "zoom_for_bounds(polygon_bounds(selected_area)" in block
-    assert "13.6" in block, "site mode should keep its closer fixed zoom"
+    assert "site_zoom(site)" in block, "site mode has its own framing rule"
     assert "9.9" in block, "discovery should keep the city overview"
+
+
+def test_site_framing_shows_the_radius_and_the_nearest_district_edge():
+    """
+    v8.1: a site view has two jobs — show the competitors inside the search
+    radius, and say which neighbourhood the address is in.
+
+    A flat zoom 13.6 did neither reliably (a large district fell entirely
+    outside the frame). Fitting the district's own bbox failed for an
+    address near an edge, because that fit assumes the map is centred on
+    the district's centre while a site map is centred on the ADDRESS.
+    Mirroring the bbox around the site fixed the framing but shrank the
+    competitor dots to specks whenever the address sat at the edge of a
+    large district.
+
+    So the rule is the union of the two things that must be visible: the
+    whole search radius, and the NEAREST boundary — which is all it takes
+    to answer "which neighbourhood is this?".
+    """
+    import math
+
+    import app as app_mod
+
+    assert app_mod.SITE_MAX_ZOOM == 13.6, "the close framing is unchanged"
+    idx = app_mod.nta_index()
+    pane_w, pane_h = app_mod.MAP_PANE_PX["assess"]
+
+    for code in ("MN0303", "MN0602", "SI0107", "QN0101", "BK0101"):
+        x0, y0, x1, y1 = idx.features[code]["bbox"]
+        # a site at the district's WEST edge, the case that used to fail
+        for lat, lon, where in (((y0 + y1) / 2, (x0 + x1) / 2, "centre"),
+                                ((y0 + y1) / 2, x0 + (x1 - x0) * 0.02,
+                                 "west edge")):
+            site = {"lat": lat, "lon": lon, "label": code}
+            for radius in (350, 500):
+                zoom = app_mod.site_zoom(site, radius_m=radius)
+                assert zoom <= app_mod.SITE_MAX_ZOOM, (code, where)
+                scale = app_mod.BASEMAP_TILE_PX * (2 ** zoom) / 360.0
+                cos_lat = math.cos(math.radians(lat))
+
+                # the whole search radius is inside the pane
+                ring_h = 2 * (radius / 111_320.0) * scale / cos_lat
+                ring_w = 2 * (radius / 111_320.0) * scale
+                assert ring_h <= pane_h and ring_w <= pane_w, (
+                    code, where, radius, "the search radius is cropped")
+
+                # and at least one district edge is in frame
+                half_lon_view = (pane_w / 2) / scale
+                half_lat_view = (pane_h / 2) / scale * cos_lat
+                near_lon = min(abs(lon - x0), abs(x1 - lon))
+                near_lat = min(abs(lat - y0), abs(y1 - lat))
+                assert (near_lon <= half_lon_view
+                        or near_lat <= half_lat_view), (
+                    code, where, radius,
+                    "no district boundary visible from this address")
+
+
+def test_site_mode_draws_the_containing_district_boundary():
+    """The address marker alone never says which district it sits in."""
+    block = APP_SRC.split("# --- containing district, in SITE mode")[1]
+    block = block.split("# --- selection emphasis")[0]
+    assert "site is not None and not selected_area" in block
+    assert "nta_index().locate(" in block
+    assert "SELECTED_LINE_WIDTH" in block
 
 
 # ======================================================= v7.2 filter labels

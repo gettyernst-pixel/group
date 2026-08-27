@@ -86,6 +86,146 @@ LOADER_CSS = """
 """
 
 
+#: Session key the overlay reads. An action that is about to cause real
+#: work writes its message here; main() renders the overlay before doing
+#: any of that work and clears the key once the page has finished.
+LOADING_KEY = "_loading_message"
+
+#: Above everything the app draws, just below Streamlit's own header
+#: (999990). The header is not an escape hatch — assets/styles.css hides
+#: its action elements — the ordering simply avoids fighting Streamlit's
+#: chrome for the top of the stack. Nothing underneath is meant to be
+#: reachable while the overlay is up: that is the point of it.
+OVERLAY_Z = 999985
+
+
+def overlay_css() -> str:
+    """
+    The one full-viewport loading overlay.
+
+    WHY AN OVERLAY AND NOT A SPINNER: Streamlit streams its output, so a
+    slow run paints a half-built page. Reproduced in the browser 600ms into
+    an address analysis, the screen held: an empty map container, a cache
+    spinner reading "RANKING CONCEPTS FOR THIS AREA…", and two orphaned
+    methodology expander headers ("What does this mean?", "How each signal
+    was judged") floating with no content under them. That collage — a
+    stray rectangular box beside a loading animation — is what the loading
+    state looked like. No per-element spinner can fix it, because the
+    problem is the elements that HAVE rendered, not the ones that have not.
+
+    `position: fixed` with `inset: 0` means the overlay covers the viewport
+    no matter where in the document Streamlit places it, so it can be
+    emitted first and still hide everything that renders afterwards.
+    """
+    return f"""
+<style>
+.jx-overlay {{
+  position: fixed;
+  inset: 0;
+  z-index: {OVERLAY_Z};
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background: rgba(7, 17, 31, 0.86);
+  backdrop-filter: blur(7px) saturate(0.7);
+  -webkit-backdrop-filter: blur(7px) saturate(0.7);
+  /* DELAYED, so fast work never flashes a full-screen overlay.
+     Warm interactions finish in well under 200ms — measured at
+     18ms for a cached area click — and an overlay that appears and
+     vanishes inside that window is a flicker, not feedback. The
+     element is in the DOM immediately (so nothing behind it can be
+     seen or clicked) but stays transparent until the work has
+     lasted long enough to be worth reporting. Same reasoning as
+     Streamlit's own 0.5s spinner delay, a little quicker. */
+  opacity: 0;
+  animation: jx-overlay-in 160ms ease-out 260ms forwards;
+}}
+/* No backdrop-filter (older Safari/Firefox): fall back to a heavier wash so
+   the page underneath is still unreadable rather than half-legible. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {{
+  .jx-overlay {{ background: rgba(7, 17, 31, 0.97); }}
+}}
+.jx-overlay img {{ animation: jx-float 1.25s ease-in-out infinite; }}
+.jx-overlay .msg {{
+  font-family: "DM Mono", SFMono-Regular, monospace;
+  font-size: 12px; letter-spacing: 0.10em; text-transform: uppercase;
+  color: #9AAABD; text-align: center; max-width: 34ch; line-height: 1.7;
+}}
+@keyframes jx-overlay-in {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+@media (prefers-reduced-motion: reduce) {{
+  /* No fade, but it must still become visible — `animation: none` alone
+     would leave opacity:0 and show a page that cannot be interacted with. */
+  .jx-overlay {{ animation: none; opacity: 1; }}
+  .jx-overlay img {{ animation: none; opacity: 0.9; }}
+}}
+</style>
+"""
+
+
+def overlay_html(message: str, height: int = 54) -> str:
+    """The overlay's markup: one chair, one message, both centred."""
+    return (f'<div class="jx-overlay" role="status" aria-live="polite" '
+            f'aria-busy="true">'
+            + logo_img(height=height, color=ACCENT, alt="")
+            + f'<div class="msg">{message}</div></div>')
+
+
+@contextmanager
+def global_loader(message: str | None, clear_key: str | None = LOADING_KEY):
+    """
+    Cover the whole viewport while a block of real work runs.
+
+    Emitted BEFORE the work, so the browser paints it immediately and every
+    element produced afterwards is hidden behind it — which is the whole
+    point: the user sees one deliberate loading state instead of a page
+    assembling itself in pieces.
+
+    On a rerun or st.stop() the overlay is deliberately LEFT UP and the
+    session key is left set, so a transition that spans two runs (the
+    normal Streamlit pattern of mutate-then-rerun) stays covered instead of
+    flashing the half-built page between them. It comes down only when a
+    run finishes normally, which is exactly when there is a complete page
+    underneath it.
+
+    An ERROR is the one case that must not follow that rule. If the body
+    raises, Streamlit renders a traceback — and leaving the overlay up
+    would hide it behind a full-screen blur with a chair on it, giving the
+    user a frozen app instead of a message. So a real exception takes the
+    overlay down and clears the pending message (otherwise the next run
+    would raise it again over the same error) before re-raising.
+    """
+    import streamlit as st
+
+    def dismiss() -> None:
+        slot.empty()
+        if clear_key:
+            st.session_state.pop(clear_key, None)
+
+    slot = st.empty()
+    if message:
+        slot.markdown(overlay_html(message), unsafe_allow_html=True)
+    try:
+        yield
+    except BaseException as exc:
+        # Streamlit signals rerun/stop with exceptions; those are control
+        # flow, not failure, and the transition they start should stay
+        # covered. Matched by name so this does not depend on the private
+        # module path they live in, which moves between versions.
+        # ONLY a rerun keeps it up. st.stop() looks similar but is not:
+        # a rerun schedules another run that will finish the transition and
+        # take the overlay down, while a stop ends the run with no
+        # successor — so treating them alike would leave the overlay
+        # covering whatever the app stopped to show (the "processed data
+        # not found" error, for one) with no way back.
+        if message and type(exc).__name__ != "RerunException":
+            dismiss()
+        raise
+    if message:
+        dismiss()
+
+
 def spinner_css() -> str:
     """
     Make Streamlit's OWN spinner the chair, everywhere.

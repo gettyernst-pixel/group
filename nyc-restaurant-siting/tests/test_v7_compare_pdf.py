@@ -92,7 +92,7 @@ def test_new_search_clears_previous_cuisine():
     assert ss(at, "stage") == "landing"
     assert ss(at, "cuisine") is None
     assert ss(at, "ws_concept") is None
-    assert ss(at, "comparison_area_ids") is None
+    assert not (ss(at, "comparison_locations") or [])
     assert ss(at, "confirmed_plan") is None
 
 
@@ -188,10 +188,24 @@ def test_filter_control_has_three_options_with_cuisine():
 
 
 # ------------------------------------------------------------- comparison
+
+
+def _area(code: str) -> dict:
+    """An entry in the canonical comparison store.
+
+    v8 replaced the bare list of NTA codes with one store that holds areas
+    AND exact sites, because an "Add to comparison" button existed only in
+    the area panel — absent in site mode, which is what made the action
+    look intermittent.
+    """
+    return {"kind": "area", "id": f"area:{code}", "area_code": code,
+            "display_name": code, "address": None}
+
 def _compare_ready() -> AppTest:
     at = injected_run(plan_parser.RestaurantPlan(cuisine="Italian",
                                                  neighborhood="Gramercy"))
-    at.session_state["comparison_area_ids"] = ["MN0602", "MN0603"]
+    at.session_state["comparison_locations"] = [
+        _area("MN0602"), _area("MN0603")]
     return at.run()
 
 
@@ -200,9 +214,10 @@ def test_add_to_comparison_from_area_panel():
                                                  neighborhood="Gramercy"))
     add = next(b for b in at.button if "Add to comparison" in str(b.label))
     at = add.click().run()
-    assert ss(at, "comparison_area_ids") == ["MN0602"]
+    assert [e["area_code"] for e in ss(at, "comparison_locations")] \
+        == ["MN0602"]
     body = " ".join(m.value for m in at.markdown)
-    assert "Compare areas" in body                 # tray appeared
+    assert "Compare" in body                       # tray appeared
     # the add control now reads as added
     assert any("Added to comparison" in str(b.label) for b in at.button)
 
@@ -216,14 +231,14 @@ import sys
 sys.path.insert(0, {str(config.APP_DIR)!r})
 import streamlit as st
 import app
-st.session_state["comparison_area_ids"] = ["MN0602"]
+st.session_state["comparison_locations"] = [app.make_area_entry("MN0602")]
 event = {{"selection": {{"points": [{{"location": "MN0303"}}]}}}}
 try:
     app._apply_map_selection(event, None)
 except Exception as exc:
     st.write("rerun:", type(exc).__name__)
 st.write("selected:", str(st.session_state.get("selected_area")))
-st.write("queued:", ",".join(st.session_state.get("comparison_area_ids")))
+st.write("queued:", ",".join(app.comparison_area_codes()))
 """
     at = AppTest.from_string(script)
     at.run()
@@ -237,12 +252,13 @@ st.write("queued:", ",".join(st.session_state.get("comparison_area_ids")))
 def test_maximum_three_areas_enforced():
     at = injected_run(plan_parser.RestaurantPlan(cuisine="Italian",
                                                  neighborhood="Gramercy"))
-    at.session_state["comparison_area_ids"] = ["MN0603", "MN0401", "MN0303"]
+    at.session_state["comparison_locations"] = [
+        _area("MN0603"), _area("MN0401"), _area("MN0303")]
     at.session_state["selected_area"] = "MN0602"
     at = at.run()
     full = [b for b in at.button if "Comparison full" in str(b.label)]
     assert full and full[0].disabled
-    assert len(ss(at, "comparison_area_ids")) == 3
+    assert len(ss(at, "comparison_locations")) == 3
 
 
 def test_compare_view_metrics_equal_standalone_analyses():
@@ -574,6 +590,7 @@ def test_compare_appears_in_nav_only_with_two_areas():
     at = injected_run(plan_parser.RestaurantPlan(cuisine="Italian",
                                                  neighborhood="Gramercy"))
     assert not any(b.label == "Compare" for b in at.button)
-    at.session_state["comparison_area_ids"] = ["MN0602", "MN0603"]
+    at.session_state["comparison_locations"] = [
+        _area("MN0602"), _area("MN0603")]
     at = at.run()
     assert any(b.label == "Compare" for b in at.button)
